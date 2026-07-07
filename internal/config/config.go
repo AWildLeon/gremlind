@@ -1,0 +1,168 @@
+// Package config loads and validates the gremlind YAML configuration shared by
+// the server (concentrator) and client (dialer) roles.
+package config
+
+import (
+	"fmt"
+	"net"
+	"net/netip"
+	"os"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Duration is a time.Duration that unmarshals from a Go duration string
+// (e.g. "15s") in YAML.
+type Duration time.Duration
+
+func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
+	var s string
+	if err := value.Decode(&s); err != nil {
+		return err
+	}
+	parsed, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	*d = Duration(parsed)
+	return nil
+}
+
+// Std returns the underlying time.Duration.
+func (d Duration) Std() time.Duration { return time.Duration(d) }
+
+// Auth configures peer authentication for the control channel.
+type Auth struct {
+	// PSK is the global pre-shared key used when no per-client secret matches.
+	PSK string `yaml:"psk"`
+	// Clients maps a client ID to its individual secret (takes precedence over PSK).
+	Clients map[string]string `yaml:"clients"`
+}
+
+// Hooks are optional scripts run on interface up/down (pppd-style ip-up/ip-down).
+type Hooks struct {
+	Up   string `yaml:"up"`
+	Down string `yaml:"down"`
+}
+
+// Config is the on-disk configuration. It is IPv6-native: address-family fields
+// accept both v6 (default) and v4 values.
+type Config struct {
+	// Listen is the control-channel bind address, e.g. "[::]:4747".
+	Listen string `yaml:"listen"`
+	// GRELocal is the server's outer GRE endpoint address (v6 default).
+	GRELocal string `yaml:"gre_local"`
+	// InnerPool is the CIDR from which inner tunnel addresses are assigned.
+	InnerPool string `yaml:"inner_pool"`
+	// ServerInner is the server's own inner address (must fall within InnerPool).
+	ServerInner string `yaml:"server_inner"`
+	// MTU is a hard upper bound on the negotiated tunnel MTU; 0 means "auto".
+	MTU int `yaml:"mtu"`
+	// AdminSocket is the unix socket path for `gremlind status`; "" disables it.
+	AdminSocket string `yaml:"admin_socket"`
+
+	KeepaliveInterval Duration `yaml:"keepalive_interval"`
+	KeepaliveTimeout  Duration `yaml:"keepalive_timeout"`
+
+	Auth  Auth  `yaml:"auth"`
+	Hooks Hooks `yaml:"hooks"`
+
+	// Client holds dialer-role settings (used by `gremlind connect`).
+	Client Client `yaml:"client"`
+}
+
+// Client configures the dialer role.
+type Client struct {
+	// ID identifies this client to the server (matched against auth.clients).
+	ID string `yaml:"id"`
+	// Secret is the shared secret; falls back to auth.psk when empty.
+	Secret string `yaml:"secret"`
+}
+
+// DefaultListen is used when Listen is empty. It is v6-native/dual-stack.
+const DefaultListen = "[::]:4747"
+
+// Load reads and validates the config at path.
+func Load(path string) (*Config, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	var c Config
+	if err := yaml.Unmarshal(raw, &c); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	c.applyDefaults()
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (c *Config) applyDefaults() {
+	if c.Listen == "" {
+		c.Listen = DefaultListen
+	}
+	if c.KeepaliveInterval == 0 {
+		c.KeepaliveInterval = Duration(15 * time.Second)
+	}
+	if c.KeepaliveTimeout == 0 {
+		c.KeepaliveTimeout = Duration(45 * time.Second)
+	}
+}
+
+// validate performs role-agnostic checks. Fields only required by the server
+// role (pool, gre_local) are validated when present; the server startup path
+// additionally calls ValidateServer.
+func (c *Config) validate() error {
+	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
+		return fmt.Errorf("invalid listen %q: %w", c.Listen, err)
+	}
+	if c.MTU < 0 {
+		return fmt.Errorf("mtu must be >= 0, got %d", c.MTU)
+	}
+	if c.KeepaliveTimeout.Std() <= c.KeepaliveInterval.Std() {
+		return fmt.Errorf("keepalive_timeout (%s) must exceed keepalive_interval (%s)",
+			c.KeepaliveTimeout.Std(), c.KeepaliveInterval.Std())
+	}
+	if c.InnerPool != "" {
+		if _, err := netip.ParsePrefix(c.InnerPool); err != nil {
+			return fmt.Errorf("invalid inner_pool %q: %w", c.InnerPool, err)
+		}
+	}
+	if c.GRELocal != "" {
+		if _, err := netip.ParseAddr(c.GRELocal); err != nil {
+			return fmt.Errorf("invalid gre_local %q: %w", c.GRELocal, err)
+		}
+	}
+	return nil
+}
+
+// ValidateServer checks fields that the server role additionally requires.
+func (c *Config) ValidateServer() error {
+	if c.GRELocal == "" {
+		return fmt.Errorf("gre_local is required in server mode")
+	}
+	if c.InnerPool == "" {
+		return fmt.Errorf("inner_pool is required in server mode")
+	}
+	pool, err := netip.ParsePrefix(c.InnerPool)
+	if err != nil {
+		return fmt.Errorf("invalid inner_pool: %w", err)
+	}
+	if c.ServerInner == "" {
+		return fmt.Errorf("server_inner is required in server mode")
+	}
+	inner, err := netip.ParseAddr(c.ServerInner)
+	if err != nil {
+		return fmt.Errorf("invalid server_inner: %w", err)
+	}
+	if !pool.Contains(inner) {
+		return fmt.Errorf("server_inner %s is not within inner_pool %s", inner, pool)
+	}
+	if c.Auth.PSK == "" && len(c.Auth.Clients) == 0 {
+		return fmt.Errorf("auth: at least a psk or per-client secrets are required")
+	}
+	return nil
+}

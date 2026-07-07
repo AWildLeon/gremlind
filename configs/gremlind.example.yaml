@@ -1,0 +1,33 @@
+# gremlind example configuration (IPv6-native; v4 values are also accepted).
+
+# Control-channel bind address. v6-native / dual-stack.
+listen: "[::]:4747"
+
+# Server outer GRE endpoint. v6 by default; an IPv4 address is also valid.
+gre_local: "2001:db8::10"
+
+# Inner-address pool handed out to clients (point-to-point pairs).
+inner_pool: "fd00:9::/112"
+server_inner: "fd00:9::1"
+
+# 0 = negotiate MTU automatically from both peers' outer MTU.
+# >0 = hard upper bound on the negotiated tunnel MTU.
+mtu: 0
+
+# Unix socket for `gremlind status`. Empty string disables it.
+admin_socket: "/run/gremlind.sock"
+
+keepalive_interval: 15s
+keepalive_timeout: 45s
+
+auth:
+  psk: "change-me"
+  # Or per-client secrets (take precedence over psk):
+  # clients:
+  #   site-a: "secret-a"
+  #   site-b: "secret-b"
+
+# Optional pppd-style hooks run on interface up/down.
+hooks:
+  up: ""
+  down: ""
