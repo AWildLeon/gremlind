@@ -28,6 +28,11 @@ connection cleanly ends the session.
   MTU minus the GRE overhead, not a static config value.
 - **Native GRE** whenever there is no NAT in the path. (GRE-in-UDP / FOU as a NAT
   fallback is future work.)
+- **Deterministic link-locals**: every tunnel gets fixed `fe80::1` (server) /
+  `fe80::2` (client), so routing protocols over the tunnel have a stable next-hop.
+- **Minimal dependencies**: the data-plane talks to the kernel over a small,
+  self-contained rtnetlink layer (`golang.org/x/sys/unix` only) — no third-party
+  netlink library.
 - HMAC challenge-response authentication over a pre-shared key (per-client secrets
   supported) — the secret never crosses the wire.
 - **Seamless roaming**: a client that changes its outer IP (DSL reconnect,
@@ -104,7 +109,7 @@ recovers with the same inner IP), and server-side teardown on disconnect.
 | `cmd/gremlind` | CLI: `server`, `connect`, `status` |
 | `internal/control` | Control protocol: wire format, codec, state machines |
 | `internal/session` | Session registry, MTU negotiation, data-plane orchestration |
-| `internal/gre` | GRE interfaces via netlink (`ip6gre`/`ip_gre`) |
+| `internal/gre` | GRE interfaces via a self-contained rtnetlink layer (`ip6gre`/`gre`) |
 | `internal/ippool` | Inner-address allocation |
 | `internal/auth` | HMAC challenge-response |
 | `internal/hooks` | up/down hook runner |

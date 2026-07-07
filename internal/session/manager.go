@@ -158,6 +158,7 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 		MTU:        mtu,
 		InnerLocal: m.serverInner,
 		InnerPeer:  clientInner,
+		LinkLocal:  gre.ServerLinkLocal,
 	}); err != nil {
 		m.mu.Lock()
 		if m.sessions[key] == entry {

@@ -116,6 +116,21 @@ ip -d link show type ip6gre || true
 echo "== client-side interface =="
 cns ip -d link show grem0 || true
 
+echo "== deterministic link-locals =="
+SRV_IF=$(ip -o link show type ip6gre | awk -F': ' '/grem[0-9a-f]/{split($2,a,"@"); print a[1]; exit}')
+echo "server $SRV_IF:"; ip -6 addr show dev "$SRV_IF" scope link
+echo "client grem0:"; cns ip -6 addr show dev grem0 scope link
+if ! ip -6 addr show dev "$SRV_IF" scope link | grep -q "fe80::1/64"; then
+  echo "E2E RESULT: FAIL (server link-local != fe80::1)"; exit 1
+fi
+if ! cns ip -6 addr show dev grem0 scope link | grep -q "fe80::2/64"; then
+  echo "E2E RESULT: FAIL (client link-local != fe80::2)"; exit 1
+fi
+if ip -6 addr show dev "$SRV_IF" scope link | grep -qiE "fe80::[0-9a-f]{2,}"; then
+  echo "E2E RESULT: FAIL (unexpected extra/random link-local present)"; exit 1
+fi
+echo "link-locals OK: server fe80::1, client fe80::2 (no random LL)"
+
 echo "== ping server inner ($SRV_INNER) through the tunnel =="
 if ! cns ping -6 -c 3 -W 2 "$SRV_INNER"; then
   echo "E2E RESULT: FAIL (ping)"

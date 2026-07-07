@@ -280,6 +280,7 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 		MTU:        int(sess.MTU),
 		InnerLocal: sess.ClientInner,
 		InnerPeer:  sess.ServerInner,
+		LinkLocal:  gre.ClientLinkLocal,
 	}); err != nil {
 		return sess.ClientInner, true, fmt.Errorf("build local GRE interface: %w", err)
 	}

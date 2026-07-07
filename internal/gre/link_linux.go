@@ -1,15 +1,26 @@
-// Package gre manages the GRE data-plane interfaces via netlink. It selects
-// ip6gre for IPv6 outer endpoints (the default) and ip_gre for IPv4, and it
-// computes the tunnel MTU overhead for negotiation.
+// Package gre manages the GRE data-plane interfaces via a small, dependency-free
+// rtnetlink layer (see netlink_linux.go). It selects ip6gre for IPv6 outer
+// endpoints (the default) and gre for IPv4, and computes the tunnel MTU overhead
+// for negotiation.
 package gre
 
 import (
 	"fmt"
-	"net"
 	"net/netip"
-
-	"github.com/vishvananda/netlink"
 )
+
+// Deterministic link-local addresses assigned per tunnel by role. Every GRE
+// interface is its own link, so reusing the same pair on all tunnels is
+// collision-free and maximally predictable: the server neighbour is always
+// fe80::1, the client neighbour always fe80::2.
+var (
+	ServerLinkLocal = netip.MustParseAddr("fe80::1")
+	ClientLinkLocal = netip.MustParseAddr("fe80::2")
+)
+
+// in6AddrGenModeNone disables the kernel's automatic (random EUI64) link-local
+// generation (IN6_ADDR_GEN_MODE_NONE).
+const in6AddrGenModeNone = 1
 
 // Params fully describes one GRE tunnel interface.
 type Params struct {
@@ -20,6 +31,7 @@ type Params struct {
 	MTU        int        // interface MTU (negotiated)
 	InnerLocal netip.Addr // inner address assigned on this interface
 	InnerPeer  netip.Addr // inner address of the tunnel peer (routed on-link)
+	LinkLocal  netip.Addr // deterministic fe80:: address; zero keeps kernel default
 }
 
 // Overhead returns the per-packet encapsulation overhead in bytes for an outer
@@ -32,50 +44,58 @@ func Overhead(outer netip.Addr) int {
 	return 20 + greWithKey // IPv4 outer header
 }
 
-// Ensure creates the GRE interface described by p, assigns its inner address,
-// routes the peer's inner address on-link, sets the MTU and brings it up. It is
-// idempotent to the extent of removing a stale interface of the same name first.
+func hostBits(a netip.Addr) int {
+	if a.Is4() {
+		return 32
+	}
+	return 128
+}
+
+// Ensure creates the GRE interface described by p, assigns its inner address and
+// deterministic link-local, routes the peer's inner address on-link, sets the
+// MTU and brings it up. Any leftover interface of the same name is removed first.
 func Ensure(p Params) error {
 	if p.Local.Is6() != p.Remote.Is6() {
 		return fmt.Errorf("gre: outer local/remote address families differ (%s vs %s)", p.Local, p.Remote)
 	}
 	// Clean up any leftover interface with this name from a prior crash.
-	if existing, err := netlink.LinkByName(p.Name); err == nil {
-		_ = netlink.LinkDel(existing)
+	if idx, err := linkIndex(p.Name); err == nil {
+		_ = linkDel(idx)
 	}
 
-	link := &netlink.Gretun{
-		LinkAttrs: netlink.LinkAttrs{Name: p.Name, MTU: p.MTU},
-		Local:     p.Local.AsSlice(),
-		Remote:    p.Remote.AsSlice(),
-		IKey:      p.Key,
-		OKey:      p.Key,
-	}
-	if err := netlink.LinkAdd(link); err != nil {
+	if err := createGRE(p); err != nil {
 		return fmt.Errorf("gre: create %s: %w", p.Name, err)
 	}
+	idx, err := linkIndex(p.Name)
+	if err != nil {
+		return fmt.Errorf("gre: locate new interface %s: %w", p.Name, err)
+	}
 
-	// From here on, unwind on failure so we don't leak a half-configured link.
+	// Unwind on any failure so we never leak a half-configured link.
 	cleanup := func(cause error) error {
-		_ = netlink.LinkDel(link)
+		_ = linkDel(idx)
 		return cause
 	}
 
-	addr := &netlink.Addr{IPNet: hostNet(p.InnerLocal)}
-	if err := netlink.AddrAdd(link, addr); err != nil {
+	// scopeLink (253) keeps the fe80:: address link-scoped.
+	const scopeLink = 253
+	if p.LinkLocal.IsValid() {
+		// Suppress the kernel's random link-local before assigning ours.
+		if err := setAddrGenModeNone(idx); err != nil {
+			return cleanup(fmt.Errorf("gre: disable addr autogen on %s: %w", p.Name, err))
+		}
+		if err := addrAdd(idx, p.LinkLocal, 64, scopeLink); err != nil {
+			return cleanup(fmt.Errorf("gre: assign link-local %s: %w", p.LinkLocal, err))
+		}
+	}
+	if err := addrAdd(idx, p.InnerLocal, hostBits(p.InnerLocal), 0 /*global*/); err != nil {
 		return cleanup(fmt.Errorf("gre: assign %s: %w", p.InnerLocal, err))
 	}
-
-	if err := netlink.LinkSetUp(link); err != nil {
+	if err := linkSetUp(idx); err != nil {
 		return cleanup(fmt.Errorf("gre: set up %s: %w", p.Name, err))
 	}
-
 	if p.InnerPeer.IsValid() {
-		route := &netlink.Route{
-			LinkIndex: link.Attrs().Index,
-			Dst:       hostNet(p.InnerPeer),
-		}
-		if err := netlink.RouteAdd(route); err != nil {
+		if err := routeAdd(idx, p.InnerPeer, hostBits(p.InnerPeer)); err != nil {
 			return cleanup(fmt.Errorf("gre: route to peer %s: %w", p.InnerPeer, err))
 		}
 	}
@@ -84,46 +104,18 @@ func Ensure(p Params) error {
 
 // Remove deletes the named GRE interface. A missing interface is not an error.
 func Remove(name string) error {
-	link, err := netlink.LinkByName(name)
+	idx, err := linkIndex(name)
 	if err != nil {
 		return nil // already gone
 	}
-	if err := netlink.LinkDel(link); err != nil {
+	if err := linkDel(idx); err != nil {
 		return fmt.Errorf("gre: delete %s: %w", name, err)
 	}
 	return nil
 }
 
-// OuterMTU returns the MTU of the interface that owns the local outer address.
-// It lets the server contribute its real link MTU to negotiation.
+// OuterMTU returns the MTU of the interface that owns the local outer address,
+// letting the server contribute its real link MTU to negotiation.
 func OuterMTU(local netip.Addr) (int, error) {
-	links, err := netlink.LinkList()
-	if err != nil {
-		return 0, err
-	}
-	family := netlink.FAMILY_V6
-	if local.Is4() {
-		family = netlink.FAMILY_V4
-	}
-	for _, l := range links {
-		addrs, err := netlink.AddrList(l, family)
-		if err != nil {
-			continue
-		}
-		for _, a := range addrs {
-			if ip, ok := netip.AddrFromSlice(a.IP); ok && ip.Unmap() == local {
-				return l.Attrs().MTU, nil
-			}
-		}
-	}
-	return 0, fmt.Errorf("gre: no interface owns outer address %s", local)
-}
-
-// hostNet returns a host-length IPNet (/32 or /128) for a.
-func hostNet(a netip.Addr) *net.IPNet {
-	bits := 128
-	if a.Is4() {
-		bits = 32
-	}
-	return &net.IPNet{IP: a.AsSlice(), Mask: net.CIDRMask(bits, bits)}
+	return linkMTUByAddr(local)
 }

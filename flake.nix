@@ -20,7 +20,7 @@
           pname = "gremlind";
           version = "0.1.0";
           src = self;
-          vendorHash = "sha256-Ir2ixFJze34VFVr3CWT9GIi5uH9XDfEKvP64KIeoAbg=";
+          vendorHash = "sha256-RuUXxEafz+DVsUWjTiJWcvVpPeEZpWZkBXxBlpoBcT8=";
           # GRE/netlink code is Linux-only.
           ldflags = [ "-s" "-w" ];
           meta = {
