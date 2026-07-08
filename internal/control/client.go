@@ -47,6 +47,9 @@ type Client struct {
 // Handshake runs the client half of HELLO→AUTH→SESSION over an established
 // connection and returns the negotiated session.
 func (c *Client) Handshake(conn net.Conn) (*Session, error) {
+	if !ValidClientID(c.ClientID) {
+		return nil, fmt.Errorf("invalid client id %q", c.ClientID)
+	}
 	br := bufio.NewReader(conn)
 	c.br = br
 	conn.SetDeadline(time.Now().Add(handshakeTimeout))
@@ -93,6 +96,9 @@ func (c *Client) Handshake(conn net.Conn) (*Session, error) {
 			}
 			return nil, fmt.Errorf("%w: %s (%s)", ErrRejected, m.Result, m.Message)
 		}
+		if !auth.VerifyServerProof(c.Secret, c.ClientID, challenge.Nonce, sessionReplyProofPayload(m), m.ServerMAC) {
+			return nil, fmt.Errorf("%w: server authentication failed", ErrRejected)
+		}
 		return &Session{
 			ClientInner: m.ClientInner,
 			ServerInner: m.ServerInner,
@@ -116,6 +122,12 @@ func (c *Client) KeepaliveLoop(ctx context.Context, conn net.Conn) error {
 		br = bufio.NewReader(conn)
 	}
 
+	// Derive a context cancelled when this loop returns, so the helper goroutines
+	// below exit promptly on a dropped connection instead of lingering until the
+	// parent context is cancelled — otherwise every reconnect leaks a goroutine.
+	loopCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	sendErr := make(chan error, 1)
 	go func() {
 		ticker := time.NewTicker(c.KeepaliveInterval)
@@ -123,7 +135,7 @@ func (c *Client) KeepaliveLoop(ctx context.Context, conn net.Conn) error {
 		var seq uint32
 		for {
 			select {
-			case <-ctx.Done():
+			case <-loopCtx.Done():
 				return
 			case <-ticker.C:
 				seq++
@@ -136,8 +148,12 @@ func (c *Client) KeepaliveLoop(ctx context.Context, conn net.Conn) error {
 	}()
 
 	go func() {
-		<-ctx.Done()
-		WriteMessage(conn, &Teardown{Reason: "client shutdown"})
+		<-loopCtx.Done()
+		// Announce shutdown to the server only on a genuine parent cancellation;
+		// on a dropped connection the write would just fail harmlessly.
+		if ctx.Err() != nil {
+			WriteMessage(conn, &Teardown{Reason: "client shutdown"})
+		}
 		conn.Close()
 	}()
 

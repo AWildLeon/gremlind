@@ -9,14 +9,31 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 
 	"gremlind/internal/auth"
 )
 
 // handshakeTimeout bounds how long an unauthenticated peer may take to complete
-// HELLO→AUTH→SESSION_REQUEST before the server drops it.
-const handshakeTimeout = 10 * time.Second
+// HELLO→AUTH→SESSION_REQUEST before the server drops it. It is a var only so
+// tests can shrink it; treat it as a constant otherwise.
+var handshakeTimeout = 10 * time.Second
+
+// maxHandshakePayload caps the payload size of any message accepted before a
+// peer authenticates. Every handshake message (Hello, Auth, SessionRequest) is
+// tiny, so this bounds the memory an unauthenticated peer can make the server
+// allocate to a few KB instead of the 64 KiB protocol maximum.
+const maxHandshakePayload = 4096
+
+// defaultMaxPendingHandshakes bounds how many connections may be mid-handshake
+// (accepted but not yet authenticated) at once. Beyond it, new connections are
+// shed immediately, so an unauthenticated connection flood cannot exhaust
+// goroutines/FDs/memory. Authenticated sessions do not count against it.
+const defaultMaxPendingHandshakes = 256
+
+// defaultMaxPendingPerIP bounds concurrent handshakes from one source IP.
+const defaultMaxPendingPerIP = 16
 
 // SessionParams describes an authenticated client's session request, handed to
 // the Establisher to provision the data-plane.
@@ -34,6 +51,7 @@ type SessionGrant struct {
 	ServerOuter netip.Addr
 	GREKey      uint32
 	MTU         uint16
+	SessionKey  uint32 // server-local registry key, not sent on the wire
 }
 
 // Establisher provisions and tears down the GRE data-plane for a session. The
@@ -54,33 +72,122 @@ type Server struct {
 	Establisher Establisher
 
 	KeepaliveTimeout time.Duration
+
+	// MaxPendingHandshakes bounds concurrent in-progress (unauthenticated)
+	// handshakes across all peers; 0 uses defaultMaxPendingHandshakes.
+	MaxPendingHandshakes int
+	// MaxPendingPerIP bounds concurrent in-progress handshakes from a single
+	// source IP, so one flooding source cannot fill the global pool and lock out
+	// legitimate clients; 0 uses defaultMaxPendingPerIP.
+	MaxPendingPerIP int
+
+	sem     chan struct{}  // global pending-handshake semaphore, sized in Serve
+	perIPMu sync.Mutex     // guards perIP
+	perIP   map[string]int // in-progress handshakes per source IP
 }
 
-// Serve accepts connections until ctx is cancelled or the listener errors.
+// Serve accepts connections until ctx is cancelled or the listener errors. It
+// bounds concurrent unauthenticated handshakes — globally and per source IP —
+// and sheds excess connections so a connection flood from an unauthenticated
+// peer can neither exhaust resources nor lock out other clients.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	if s.MaxPendingHandshakes <= 0 {
+		s.MaxPendingHandshakes = defaultMaxPendingHandshakes
+	}
+	if s.MaxPendingPerIP <= 0 {
+		s.MaxPendingPerIP = defaultMaxPendingPerIP
+	}
+	s.sem = make(chan struct{}, s.MaxPendingHandshakes)
+	s.perIP = make(map[string]int)
+
 	go func() {
 		<-ctx.Done()
 		ln.Close()
 	}()
+
+	// Track in-flight connections so shutdown can wait for their sessions to tear
+	// down cleanly (GRE interfaces removed, down hooks run) rather than exiting
+	// abruptly and leaking data-plane state.
+	var wg sync.WaitGroup
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
+				wg.Wait()
 				return nil
 			}
 			return fmt.Errorf("accept: %w", err)
 		}
-		go s.handle(ctx, conn)
+		ip := ipOf(conn.RemoteAddr())
+		if !s.reserve(ip) {
+			// At capacity: shed load without spending a goroutine or reading a
+			// byte from the untrusted peer.
+			s.Log.Warn("handshake capacity reached, dropping connection", "peer", conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.handle(ctx, conn, func() { s.release(ip) })
+		}()
 	}
 }
 
-func (s *Server) handle(ctx context.Context, conn net.Conn) {
+// reserve takes a global and a per-IP handshake slot, returning false (holding
+// neither) if either is exhausted.
+func (s *Server) reserve(ip string) bool {
+	select {
+	case s.sem <- struct{}{}:
+	default:
+		return false
+	}
+	s.perIPMu.Lock()
+	if s.perIP[ip] >= s.MaxPendingPerIP {
+		s.perIPMu.Unlock()
+		<-s.sem
+		return false
+	}
+	s.perIP[ip]++
+	s.perIPMu.Unlock()
+	return true
+}
+
+// release returns the slots taken by reserve. It is called once, when the
+// handshake resolves — an established session no longer occupies a slot.
+func (s *Server) release(ip string) {
+	s.perIPMu.Lock()
+	if s.perIP[ip] > 0 {
+		s.perIP[ip]--
+		if s.perIP[ip] == 0 {
+			delete(s.perIP, ip)
+		}
+	}
+	s.perIPMu.Unlock()
+	<-s.sem
+}
+
+func (s *Server) handle(ctx context.Context, conn net.Conn, release func()) {
 	defer conn.Close()
 	peer := conn.RemoteAddr().String()
 	log := s.Log.With("peer", peer)
 	br := bufio.NewReader(conn)
 
+	// A single watcher for the whole connection: on context cancellation it
+	// closes the conn, unblocking any read in progress (handshake or keepalive).
+	// It exits when handle returns (defer cancel), so nothing leaks per session —
+	// unlike a watcher bound to the server-lifetime context.
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		<-connCtx.Done()
+		conn.Close()
+	}()
+
 	params, grant, ok := s.handshake(ctx, conn, br, log)
+	// Release the pending-handshake slots the moment the handshake resolves; an
+	// established (authenticated) session must not hold them for its whole life.
+	release()
 	if !ok {
 		return
 	}
@@ -99,16 +206,29 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 // ok=false (after best-effort notifying the peer) on any failure.
 func (s *Server) handshake(ctx context.Context, conn net.Conn, br *bufio.Reader, log *slog.Logger) (SessionParams, SessionGrant, bool) {
 	conn.SetDeadline(time.Now().Add(handshakeTimeout))
+	// Clear the handshake deadline before entering the keepalive phase; otherwise
+	// the write half stays pinned to now+handshakeTimeout and the first EchoAck
+	// sent after it expires fails with i/o timeout. keepaliveLoop manages its own
+	// read deadline from here on (mirrors the client's Handshake).
+	defer conn.SetDeadline(time.Time{})
 
 	hello, ok := expect[*Hello](br, log, "hello")
 	if !ok {
 		return SessionParams{}, SessionGrant{}, false
 	}
+	if !ValidClientID(hello.ClientID) {
+		log.Warn("invalid client id")
+		writeTeardown(conn, "invalid client id")
+		return SessionParams{}, SessionGrant{}, false
+	}
 	secret := auth.SecretFor(hello.ClientID, s.PSK, s.Clients)
 	if secret == "" {
-		log.Warn("unknown client id", "client", hello.ClientID)
-		writeTeardown(conn, "unknown client")
-		return SessionParams{}, SessionGrant{}, false
+		// Unknown client. Do not reveal it: continue the handshake against an
+		// unguessable random secret so authentication fails at the AUTH step
+		// exactly like a wrong credential, with the same generic reason. This
+		// removes a client-ID enumeration oracle.
+		log.Debug("unknown client id (failing uniformly)", "client", hello.ClientID)
+		secret = auth.RandomSecret()
 	}
 
 	nonce, err := auth.NewNonce()
@@ -162,6 +282,7 @@ func (s *Server) handshake(ctx context.Context, conn net.Conn, br *bufio.Reader,
 		GREKey:      grant.GREKey,
 		MTU:         grant.MTU,
 	}
+	reply.ServerMAC = auth.ServerProof(secret, hello.ClientID, nonce, sessionReplyProofPayload(reply))
 	if err := WriteMessage(conn, reply); err != nil {
 		s.Establisher.Teardown(params, grant)
 		return SessionParams{}, SessionGrant{}, false
@@ -170,12 +291,9 @@ func (s *Server) handshake(ctx context.Context, conn net.Conn, br *bufio.Reader,
 }
 
 // keepaliveLoop replies to Echo probes and drops the peer if it goes silent for
-// longer than KeepaliveTimeout. The client drives the probe cadence.
+// longer than KeepaliveTimeout. The client drives the probe cadence. The caller
+// (handle) owns the context watcher that closes conn on shutdown.
 func (s *Server) keepaliveLoop(ctx context.Context, conn net.Conn, br *bufio.Reader, log *slog.Logger) {
-	go func() {
-		<-ctx.Done()
-		conn.Close()
-	}()
 	for {
 		conn.SetReadDeadline(time.Now().Add(s.KeepaliveTimeout))
 		msg, err := ReadMessage(br)
@@ -202,7 +320,7 @@ func (s *Server) keepaliveLoop(ctx context.Context, conn net.Conn, br *bufio.Rea
 // expect reads the next message and asserts its concrete type.
 func expect[T Message](br *bufio.Reader, log *slog.Logger, what string) (T, bool) {
 	var zero T
-	msg, err := ReadMessage(br)
+	msg, err := ReadMessageLimited(br, maxHandshakePayload)
 	if err != nil {
 		if !errors.Is(err, io.EOF) {
 			log.Debug("read failed", "want", what, "err", err)
@@ -229,4 +347,16 @@ func outerAddr(a net.Addr) netip.Addr {
 		}
 	}
 	return netip.Addr{}
+}
+
+// ipOf returns the source IP of a peer address as a string key for per-IP
+// accounting, falling back to the full address string if it cannot be parsed.
+func ipOf(a net.Addr) string {
+	if tcp, ok := a.(*net.TCPAddr); ok {
+		return tcp.IP.String()
+	}
+	if host, _, err := net.SplitHostPort(a.String()); err == nil {
+		return host
+	}
+	return a.String()
 }

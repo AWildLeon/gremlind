@@ -5,11 +5,12 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net/netip"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"gremlind/internal/control"
@@ -50,15 +51,14 @@ type Manager struct {
 	serverInner netip.Addr
 	greLocal    netip.Addr
 	outerMTU    int
-	mtuCap      int // hard upper bound from config; 0 = none
+	mtuCap      int  // hard upper bound from config; 0 = none
+	useGREKey   bool // whether to set GRE key fields; false = plain GRE
 	upHook      string
 	downHook    string
 
-	keyCounter atomic.Uint32
-
 	mu       sync.Mutex
-	sessions map[uint32]*Entry  // active sessions keyed by GRE key
-	active   map[string]uint32  // client ID -> its current session key
+	sessions map[uint32]*Entry     // active sessions keyed by GRE key
+	active   map[string]uint32     // client ID -> its current session key
 	leases   map[string]netip.Addr // client ID -> last inner address (sticky)
 }
 
@@ -70,6 +70,7 @@ type Config struct {
 	GRELocal    netip.Addr
 	OuterMTU    int    // server's outer link MTU (0 = auto-detect)
 	MTUCap      int    // config.MTU
+	UseGREKey   bool   // true = keyed GRE; false = no GRE key field
 	UpHook      string // script run when a session interface comes up
 	DownHook    string // script run when a session interface goes down
 }
@@ -97,6 +98,7 @@ func newWith(cfg Config, prov Provisioner) *Manager {
 		greLocal:    cfg.GRELocal,
 		outerMTU:    outer,
 		mtuCap:      cfg.MTUCap,
+		useGREKey:   cfg.UseGREKey,
 		upHook:      cfg.UpHook,
 		downHook:    cfg.DownHook,
 		sessions:    make(map[uint32]*Entry),
@@ -116,8 +118,6 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 	}
 
 	mtu := m.negotiateMTU(int(p.OuterMTU))
-	key := m.nextKey()
-	ifName := fmt.Sprintf("grem%x", key)
 
 	// Under the lock: evict any stale session for the same client (roaming —
 	// the client reconnected, likely from a new outer IP), then assign the inner
@@ -129,17 +129,28 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 		m.mu.Unlock()
 		return control.SessionGrant{}, control.ResultNoAddresses, err
 	}
+	sessionKey, err := m.randomKeyLocked()
+	if err != nil {
+		m.pool.Release(clientInner)
+		m.mu.Unlock()
+		return control.SessionGrant{}, control.ResultInternal, err
+	}
+	greKey := uint32(0)
+	if m.useGREKey {
+		greKey = sessionKey
+	}
+	ifName := m.ifName(sessionKey)
 	entry := &Entry{
 		ClientID:    p.ClientID,
 		IfName:      ifName,
 		ClientInner: clientInner,
 		ClientOuter: p.ClientOuter,
-		GREKey:      key,
+		GREKey:      greKey,
 		MTU:         mtu,
 		Since:       time.Now(),
 	}
-	m.sessions[key] = entry
-	m.active[p.ClientID] = key
+	m.sessions[sessionKey] = entry
+	m.active[p.ClientID] = sessionKey
 	m.leases[p.ClientID] = clientInner
 	m.mu.Unlock()
 
@@ -154,16 +165,16 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 		Name:       ifName,
 		Local:      m.greLocal,
 		Remote:     p.ClientOuter,
-		Key:        key,
+		Key:        greKey,
 		MTU:        mtu,
 		InnerLocal: m.serverInner,
 		InnerPeer:  clientInner,
 		LinkLocal:  gre.ServerLinkLocal,
 	}); err != nil {
 		m.mu.Lock()
-		if m.sessions[key] == entry {
-			delete(m.sessions, key)
-			if m.active[p.ClientID] == key {
+		if m.sessions[sessionKey] == entry {
+			delete(m.sessions, sessionKey)
+			if m.active[p.ClientID] == sessionKey {
 				delete(m.active, p.ClientID)
 			}
 			m.pool.Release(clientInner)
@@ -180,7 +191,7 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 		InnerPeer:  clientInner,
 		OuterLocal: m.greLocal,
 		OuterPeer:  p.ClientOuter,
-		GREKey:     key,
+		GREKey:     greKey,
 		MTU:        mtu,
 	})
 
@@ -188,24 +199,25 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 		ClientInner: clientInner,
 		ServerInner: m.serverInner,
 		ServerOuter: m.greLocal,
-		GREKey:      key,
+		GREKey:      greKey,
 		MTU:         uint16(mtu),
+		SessionKey:  sessionKey,
 	}, control.ResultOK, nil
 }
 
 // Teardown implements control.Establisher. It is idempotent and keyed on the
-// GRE key: if the session was already superseded by a roaming reconnect, the
-// stale connection's teardown finds no entry and does nothing — crucially, it
-// must not release the inner address the new session now owns.
+// server-local session key: if the session was already superseded by a roaming
+// reconnect, the stale connection's teardown finds no entry and does nothing —
+// crucially, it must not release the inner address the new session now owns.
 func (m *Manager) Teardown(_ control.SessionParams, g control.SessionGrant) {
 	m.mu.Lock()
-	entry := m.sessions[g.GREKey]
+	entry := m.sessions[g.SessionKey]
 	if entry == nil {
 		m.mu.Unlock()
 		return // already torn down or evicted by a newer session
 	}
-	delete(m.sessions, g.GREKey)
-	if m.active[entry.ClientID] == g.GREKey {
+	delete(m.sessions, g.SessionKey)
+	if m.active[entry.ClientID] == g.SessionKey {
 		delete(m.active, entry.ClientID)
 	}
 	m.pool.Release(entry.ClientInner) // lease is kept for sticky reconnect
@@ -251,20 +263,29 @@ func (m *Manager) removeAndNotify(entry *Entry) {
 }
 
 // negotiateMTU picks the tunnel MTU: min of both peers' outer MTU minus the GRE
-// overhead, further clamped by the optional config cap.
+// overhead, further clamped by the optional config cap. It never returns a
+// non-positive or wrapped value even if an authenticated peer reports a bogus
+// tiny outer MTU.
 func (m *Manager) negotiateMTU(clientOuterMTU int) int {
 	outer := m.outerMTU
 	if clientOuterMTU > 0 && clientOuterMTU < outer {
 		outer = clientOuterMTU
 	}
-	mtu := outer - gre.Overhead(m.greLocal)
+	mtu := outer - gre.Overhead(m.greLocal, m.useGREKey)
 	if m.mtuCap > 0 && m.mtuCap < mtu {
 		mtu = m.mtuCap
 	}
-	if mtu < 1280 && m.greLocal.Is6() {
-		mtu = 1280 // IPv6 minimum link MTU
+	if minMTU := minimumTunnelMTU(m.greLocal); mtu < minMTU {
+		mtu = minMTU
 	}
 	return mtu
+}
+
+func minimumTunnelMTU(outer netip.Addr) int {
+	if outer.Is6() {
+		return 1280 // IPv6 minimum link MTU
+	}
+	return 576 // IPv4 minimum reassembly MTU; prevents negative/overflow MTUs.
 }
 
 // allocInnerLocked assigns an inner address, preferring stability: an explicit
@@ -282,12 +303,24 @@ func (m *Manager) allocInnerLocked(clientID string, requested netip.Addr) (netip
 	return m.pool.Allocate()
 }
 
-// nextKey returns a fresh non-zero GRE key.
-func (m *Manager) nextKey() uint32 {
+func (m *Manager) ifName(key uint32) string {
+	if key == 0 {
+		return "grem"
+	}
+	return fmt.Sprintf("grem%x", key)
+}
+
+// randomKeyLocked returns a fresh unpredictable non-zero GRE key. Caller must
+// hold m.mu so the active-session collision check is stable.
+func (m *Manager) randomKeyLocked() (uint32, error) {
+	var b [4]byte
 	for {
-		k := m.keyCounter.Add(1)
-		if k != 0 {
-			return k
+		if _, err := rand.Read(b[:]); err != nil {
+			return 0, fmt.Errorf("generate GRE key: %w", err)
+		}
+		k := binary.BigEndian.Uint32(b[:])
+		if k != 0 && m.sessions[k] == nil {
+			return k, nil
 		}
 	}
 }

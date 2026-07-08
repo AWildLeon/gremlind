@@ -25,29 +25,51 @@ func WriteMessage(w io.Writer, m Message) error {
 	if len(payload) > MaxPayload {
 		return fmt.Errorf("control: payload too large (%d bytes)", len(payload))
 	}
-	var hdr [frameHeaderLen]byte
-	binary.BigEndian.PutUint16(hdr[0:2], uint16(len(payload)))
-	hdr[2] = ProtoVersion
-	hdr[3] = byte(m.Type())
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
-	}
-	_, err := w.Write(payload)
-	return err
+	frame := make([]byte, frameHeaderLen, frameHeaderLen+len(payload))
+	binary.BigEndian.PutUint16(frame[0:2], uint16(len(payload)))
+	frame[2] = ProtoVersion
+	frame[3] = byte(m.Type())
+	frame = append(frame, payload...)
+	return writeFull(w, frame)
 }
 
-// ReadMessage reads and decodes a single framed message. It rejects frames with
-// an unknown protocol version or message type.
+func writeFull(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return nil
+}
+
+// ReadMessage reads and decodes a single framed message, allowing the full
+// protocol maximum payload.
 func ReadMessage(r *bufio.Reader) (Message, error) {
+	return ReadMessageLimited(r, MaxPayload)
+}
+
+// ReadMessageLimited reads and decodes a single framed message, rejecting any
+// frame whose declared payload exceeds maxPayload *before* allocating for it. It
+// also rejects unknown protocol versions and message types. The limit bounds the
+// memory an unauthenticated peer can pin during the handshake.
+func ReadMessageLimited(r *bufio.Reader, maxPayload int) (Message, error) {
 	var hdr [frameHeaderLen]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}
-	payloadLen := binary.BigEndian.Uint16(hdr[0:2])
+	payloadLen := int(binary.BigEndian.Uint16(hdr[0:2]))
 	version := hdr[2]
 	msgType := MsgType(hdr[3])
 	if version != ProtoVersion {
 		return nil, fmt.Errorf("control: unsupported protocol version %d", version)
+	}
+	if payloadLen > maxPayload {
+		return nil, fmt.Errorf("control: payload %d exceeds limit %d", payloadLen, maxPayload)
 	}
 	msg := newMessage(msgType)
 	if msg == nil {
@@ -161,6 +183,9 @@ func (d *dec) bytes() []byte {
 	if !d.need(n) {
 		return nil
 	}
+	if n == 0 {
+		return nil
+	}
 	p := make([]byte, n)
 	copy(p, d.b[d.pos:d.pos+n])
 	d.pos += n
@@ -264,6 +289,7 @@ func (m *SessionReply) marshalPayload() []byte {
 	e.u32(m.GREKey)
 	e.u16(m.MTU)
 	e.str(m.Message)
+	e.bytes(m.ServerMAC)
 	return e.b
 }
 
@@ -276,7 +302,21 @@ func (m *SessionReply) unmarshalPayload(b []byte) error {
 	m.GREKey = d.u32()
 	m.MTU = d.u16()
 	m.Message = d.str()
+	m.ServerMAC = d.bytes()
 	return d.finish()
+}
+
+// sessionReplyProofPayload returns the stable subset of a successful
+// SessionReply covered by the server-authentication HMAC.
+func sessionReplyProofPayload(m *SessionReply) []byte {
+	e := &enc{}
+	e.u8(uint8(m.Result))
+	e.addr(m.ClientInner)
+	e.addr(m.ServerInner)
+	e.addr(m.ServerOuter)
+	e.u32(m.GREKey)
+	e.u16(m.MTU)
+	return e.b
 }
 
 func (m *Echo) marshalPayload() []byte    { e := &enc{}; e.u32(m.Seq); return e.b }

@@ -222,11 +222,11 @@ func routeAdd(idx int32, dst netip.Addr, prefix int) error {
 	m := newNlmsg(unix.RTM_NEWROUTE, unix.NLM_F_REQUEST|unix.NLM_F_ACK|unix.NLM_F_CREATE)
 	rtm := make([]byte, unix.SizeofRtMsg)
 	rtm[0] = addrFamily(dst)
-	rtm[1] = byte(prefix)          // Dst_len
-	rtm[4] = unix.RT_TABLE_MAIN    // Table
-	rtm[5] = unix.RTPROT_BOOT      // Protocol
-	rtm[6] = unix.RT_SCOPE_LINK    // Scope
-	rtm[7] = unix.RTN_UNICAST      // Type
+	rtm[1] = byte(prefix)       // Dst_len
+	rtm[4] = unix.RT_TABLE_MAIN // Table
+	rtm[5] = unix.RTPROT_BOOT   // Protocol
+	rtm[6] = unix.RT_SCOPE_LINK // Scope
+	rtm[7] = unix.RTN_UNICAST   // Type
 	m.put(rtm)
 	m.attr(unix.RTA_DST, dst.AsSlice())
 	oif := make([]byte, 4)
@@ -309,10 +309,12 @@ func createGRE(p Params) error {
 	li := m.beginNested(unix.IFLA_LINKINFO)
 	m.attr(unix.IFLA_INFO_KIND, nameAttr(kind))
 	data := m.beginNested(unix.IFLA_INFO_DATA)
-	m.attr(iflaGreIKey, beU32(p.Key))
-	m.attr(iflaGreOKey, beU32(p.Key))
-	m.attr(iflaGreIFlags, beU16(greKeyFlag))
-	m.attr(iflaGreOFlags, beU16(greKeyFlag))
+	if p.Key != 0 {
+		m.attr(iflaGreIKey, beU32(p.Key))
+		m.attr(iflaGreOKey, beU32(p.Key))
+		m.attr(iflaGreIFlags, beU16(greKeyFlag))
+		m.attr(iflaGreOFlags, beU16(greKeyFlag))
+	}
 	m.attr(iflaGreLocal, p.Local.AsSlice())
 	m.attr(iflaGreRemote, p.Remote.AsSlice())
 	m.endNested(data)

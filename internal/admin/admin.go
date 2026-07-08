@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"time"
 
 	"gremlind/internal/session"
 )
@@ -16,18 +17,33 @@ import (
 // Serve listens on a unix socket and writes a JSON array of the current
 // sessions to each connection. It returns when ctx is cancelled.
 func Serve(ctx context.Context, log *slog.Logger, path string, snapshot func() []session.Entry) error {
-	// Remove a stale socket from a previous run.
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("admin: remove stale socket: %w", err)
+	// Remove only a stale unix socket from a previous run. Refuse to unlink any
+	// other filesystem object at the configured path.
+	if st, err := os.Lstat(path); err == nil {
+		if st.Mode()&os.ModeSocket == 0 {
+			return fmt.Errorf("admin: %s exists and is not a unix socket", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("admin: remove stale socket: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("admin: stat socket path: %w", err)
 	}
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return fmt.Errorf("admin: listen: %w", err)
 	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		ln.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("admin: chmod socket: %w", err)
+	}
 	go func() {
 		<-ctx.Done()
 		ln.Close()
-		os.Remove(path)
+		if st, err := os.Lstat(path); err == nil && st.Mode()&os.ModeSocket != 0 {
+			os.Remove(path)
+		}
 	}()
 	log.Info("admin socket listening", "path", path)
 
@@ -41,6 +57,9 @@ func Serve(ctx context.Context, log *slog.Logger, path string, snapshot func() [
 		}
 		go func(c net.Conn) {
 			defer c.Close()
+			// Bound the write so a local client that connects but never reads
+			// cannot pin this goroutine indefinitely.
+			c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if err := json.NewEncoder(c).Encode(snapshot()); err != nil {
 				log.Debug("admin encode failed", "err", err)
 			}

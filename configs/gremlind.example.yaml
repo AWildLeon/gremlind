@@ -14,18 +14,32 @@ server_inner: "fd00:9::1"
 # >0 = hard upper bound on the negotiated tunnel MTU.
 mtu: 0
 
+# Use GRE key fields as a demultiplexing identifier (like a port number). Set to
+# false for plain GRE without keys. Keys are not an authentication mechanism.
+gre_key: true
+
 # Unix socket for `gremlind status`. Empty string disables it.
 admin_socket: "/run/gremlind.sock"
+
+# DoS hardening: bound how many connections may be mid-handshake (accepted but
+# not yet authenticated) at once — globally and per source IP. Beyond the limit
+# new connections are shed immediately. 0 = built-in defaults (256 / 16).
+# Authenticated sessions do not count against these.
+max_pending_handshakes: 0
+max_pending_per_ip: 0
 
 keepalive_interval: 15s
 keepalive_timeout: 45s
 
 auth:
-  psk: "change-me"
-  # Or per-client secrets (take precedence over psk):
+  # Use a high-entropy secret; the HMAC handshake is resistant to passive replay
+  # but captured handshakes can still be used for offline guessing of weak PSKs.
+  psk: "replace-with-at-least-32-random-bytes"
+  # Or per-client secrets. If clients is non-empty it is an allowlist; unlisted
+  # client IDs cannot fall back to the global psk.
   # clients:
-  #   site-a: "secret-a"
-  #   site-b: "secret-b"
+  #   site-a: "replace-with-random-secret-for-site-a"
+  #   site-b: "replace-with-random-secret-for-site-b"
 
 # Optional pppd-style hooks run on interface up/down.
 hooks:

@@ -58,6 +58,33 @@ func TestFrameRoundtrip(t *testing.T) {
 	}
 }
 
+type shortWriter struct {
+	bytes.Buffer
+	max int
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if len(p) > w.max {
+		p = p[:w.max]
+	}
+	return w.Buffer.Write(p)
+}
+
+func TestWriteMessageHandlesShortWrites(t *testing.T) {
+	w := &shortWriter{max: 2}
+	want := &Teardown{Reason: "short writes must still form one frame"}
+	if err := WriteMessage(w, want); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := ReadMessage(bufio.NewReader(bytes.NewReader(w.Bytes())))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !reflect.DeepEqual(want, got) {
+		t.Fatalf("roundtrip mismatch: want %#v got %#v", want, got)
+	}
+}
+
 func TestReadRejectsUnknownType(t *testing.T) {
 	// payloadLen=0, version=1, type=99
 	frame := []byte{0x00, 0x00, ProtoVersion, 99}

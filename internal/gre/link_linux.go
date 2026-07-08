@@ -27,7 +27,7 @@ type Params struct {
 	Name       string     // interface name (<= 15 chars)
 	Local      netip.Addr // outer local endpoint
 	Remote     netip.Addr // outer remote endpoint
-	Key        uint32     // GRE key (I/O), must be non-zero to demux
+	Key        uint32     // GRE key (I/O); zero disables GRE key fields
 	MTU        int        // interface MTU (negotiated)
 	InnerLocal netip.Addr // inner address assigned on this interface
 	InnerPeer  netip.Addr // inner address of the tunnel peer (routed on-link)
@@ -35,13 +35,16 @@ type Params struct {
 }
 
 // Overhead returns the per-packet encapsulation overhead in bytes for an outer
-// endpoint of the given family, with a GRE key always present (+4).
-func Overhead(outer netip.Addr) int {
-	const greWithKey = 4 + 4 // base GRE header + key field
-	if outer.Is6() {
-		return 40 + greWithKey // IPv6 outer header
+// endpoint of the given family. keyed defaults to true for compatibility.
+func Overhead(outer netip.Addr, keyed ...bool) int {
+	greHeader := 4 // base GRE header
+	if len(keyed) == 0 || keyed[0] {
+		greHeader += 4 // key field
 	}
-	return 20 + greWithKey // IPv4 outer header
+	if outer.Is6() {
+		return 40 + greHeader // IPv6 outer header
+	}
+	return 20 + greHeader // IPv4 outer header
 }
 
 func hostBits(a netip.Addr) int {

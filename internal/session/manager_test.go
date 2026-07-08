@@ -20,7 +20,7 @@ type fakeProv struct {
 }
 
 func (f *fakeProv) Ensure(p gre.Params) error { f.ensured = append(f.ensured, p); return nil }
-func (f *fakeProv) Remove(n string) error      { f.removed = append(f.removed, n); return nil }
+func (f *fakeProv) Remove(n string) error     { f.removed = append(f.removed, n); return nil }
 
 func newTestManager(t *testing.T, outerMTU, cap int, prov Provisioner) (*Manager, *ippool.Pool) {
 	t.Helper()
@@ -36,6 +36,7 @@ func newTestManager(t *testing.T, outerMTU, cap int, prov Provisioner) (*Manager
 		GRELocal:    netip.MustParseAddr("2001:db8::10"),
 		OuterMTU:    outerMTU,
 		MTUCap:      cap,
+		UseGREKey:   true,
 	}, prov)
 	return m, pool
 }
@@ -75,6 +76,35 @@ func TestEstablishNegotiatesMTUAndProvisions(t *testing.T) {
 	}
 }
 
+func TestEstablishCanDisableGREKeys(t *testing.T) {
+	prov := &fakeProv{}
+	m, _ := newTestManager(t, 1500, 0, prov)
+	m.useGREKey = false
+
+	grant, res, err := m.Establish(context.Background(), control.SessionParams{
+		ClientID:    "site-a",
+		ClientOuter: netip.MustParseAddr("2001:db8::20"),
+		OuterMTU:    1500,
+	})
+	if err != nil || res != control.ResultOK {
+		t.Fatalf("establish: res=%s err=%v", res, err)
+	}
+	if grant.GREKey != 0 {
+		t.Fatalf("grant GRE key = %d, want 0 when disabled", grant.GREKey)
+	}
+	if len(prov.ensured) != 1 || prov.ensured[0].Key != 0 {
+		t.Fatalf("provisioned key = %+v, want key 0", prov.ensured)
+	}
+	// v6 outer overhead without key = 40 + 4 = 44 → 1500 - 44 = 1456.
+	if grant.MTU != 1456 {
+		t.Fatalf("MTU = %d, want 1456", grant.MTU)
+	}
+	m.Teardown(control.SessionParams{}, grant)
+	if len(prov.removed) != 1 {
+		t.Fatalf("expected teardown to remove unkeyed session, removed=%v", prov.removed)
+	}
+}
+
 func TestNegotiateMTUTakesMinimumAndCap(t *testing.T) {
 	prov := &fakeProv{}
 	m, _ := newTestManager(t, 1500, 1400, prov)
@@ -87,6 +117,20 @@ func TestNegotiateMTUTakesMinimumAndCap(t *testing.T) {
 	m.mtuCap = 0
 	if got := m.negotiateMTU(1400); got != 1352 {
 		t.Errorf("mtu = %d, want 1352", got)
+	}
+	// A bogus tiny client MTU must not underflow or wrap when later encoded.
+	if got := m.negotiateMTU(1); got != 1280 {
+		t.Errorf("tiny v6 mtu = %d, want IPv6 minimum 1280", got)
+	}
+}
+
+func TestNegotiateMTUClampsTinyIPv4OuterMTU(t *testing.T) {
+	prov := &fakeProv{}
+	m, _ := newTestManager(t, 1500, 0, prov)
+	m.greLocal = netip.MustParseAddr("203.0.113.10")
+
+	if got := m.negotiateMTU(1); got != 576 {
+		t.Errorf("tiny v4 mtu = %d, want IPv4 minimum 576", got)
 	}
 }
 

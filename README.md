@@ -26,6 +26,8 @@ connection cleanly ends the session.
   endpoints. Inner pool defaults to a v6 prefix.
 - **Real MTU negotiation**: the tunnel MTU is derived from *both* peers' outer
   MTU minus the GRE overhead, not a static config value.
+- Optional GRE keys for demultiplexing (like port numbers), with plain unkeyed
+  GRE supported when desired.
 - **Native GRE** whenever there is no NAT in the path. (GRE-in-UDP / FOU as a NAT
   fallback is future work.)
 - **Deterministic link-locals**: every tunnel gets fixed `fe80::1` (server) /
@@ -33,8 +35,8 @@ connection cleanly ends the session.
 - **Minimal dependencies**: the data-plane talks to the kernel over a small,
   self-contained rtnetlink layer (`golang.org/x/sys/unix` only) — no third-party
   netlink library.
-- HMAC challenge-response authentication over a pre-shared key (per-client secrets
-  supported) — the secret never crosses the wire.
+- Mutual HMAC challenge-response authentication over a pre-shared key
+  (per-client secrets supported) — the secret never crosses the wire.
 - **Seamless roaming**: a client that changes its outer IP (DSL reconnect,
   Wi-Fi↔mobile) automatically reconnects and keeps the *same* inner address via
   sticky per-client leases; the server evicts the stale session and just updates

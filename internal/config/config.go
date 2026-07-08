@@ -9,6 +9,8 @@ import (
 	"os"
 	"time"
 
+	"gremlind/internal/control"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -59,8 +61,19 @@ type Config struct {
 	ServerInner string `yaml:"server_inner"`
 	// MTU is a hard upper bound on the negotiated tunnel MTU; 0 means "auto".
 	MTU int `yaml:"mtu"`
+	// GREKey controls whether tunnels use GRE key fields for demux. nil defaults
+	// to enabled; false creates plain GRE tunnels without keys.
+	GREKey *bool `yaml:"gre_key"`
 	// AdminSocket is the unix socket path for `gremlind status`; "" disables it.
 	AdminSocket string `yaml:"admin_socket"`
+	// MaxPendingHandshakes bounds concurrent unauthenticated handshakes (server
+	// role); 0 uses a built-in default. It caps the resources an unauthenticated
+	// connection flood can pin.
+	MaxPendingHandshakes int `yaml:"max_pending_handshakes"`
+	// MaxPendingPerIP bounds concurrent unauthenticated handshakes from a single
+	// source IP; 0 uses a built-in default. It stops one source from filling the
+	// global pending pool and locking out other clients.
+	MaxPendingPerIP int `yaml:"max_pending_per_ip"`
 
 	KeepaliveInterval Duration `yaml:"keepalive_interval"`
 	KeepaliveTimeout  Duration `yaml:"keepalive_timeout"`
@@ -93,14 +106,18 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	c.applyDefaults()
+	c.ApplyDefaults()
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
 	return &c, nil
 }
 
-func (c *Config) applyDefaults() {
+// ApplyDefaults fills in unset fields with their defaults. It is idempotent and
+// safe to call on a config that was built without going through Load (e.g. the
+// dialer's config-less path), so the keepalive durations are never left zero —
+// a zero interval would panic time.NewTicker.
+func (c *Config) ApplyDefaults() {
 	if c.Listen == "" {
 		c.Listen = DefaultListen
 	}
@@ -112,6 +129,9 @@ func (c *Config) applyDefaults() {
 	}
 }
 
+// GREKeyEnabled reports whether GRE key fields should be used.
+func (c *Config) GREKeyEnabled() bool { return c.GREKey == nil || *c.GREKey }
+
 // validate performs role-agnostic checks. Fields only required by the server
 // role (pool, gre_local) are validated when present; the server startup path
 // additionally calls ValidateServer.
@@ -121,6 +141,18 @@ func (c *Config) validate() error {
 	}
 	if c.MTU < 0 {
 		return fmt.Errorf("mtu must be >= 0, got %d", c.MTU)
+	}
+	if c.MaxPendingHandshakes < 0 {
+		return fmt.Errorf("max_pending_handshakes must be >= 0, got %d", c.MaxPendingHandshakes)
+	}
+	if c.MaxPendingPerIP < 0 {
+		return fmt.Errorf("max_pending_per_ip must be >= 0, got %d", c.MaxPendingPerIP)
+	}
+	if c.KeepaliveInterval.Std() <= 0 {
+		return fmt.Errorf("keepalive_interval must be positive, got %s", c.KeepaliveInterval.Std())
+	}
+	if c.KeepaliveTimeout.Std() <= 0 {
+		return fmt.Errorf("keepalive_timeout must be positive, got %s", c.KeepaliveTimeout.Std())
 	}
 	if c.KeepaliveTimeout.Std() <= c.KeepaliveInterval.Std() {
 		return fmt.Errorf("keepalive_timeout (%s) must exceed keepalive_interval (%s)",
@@ -163,6 +195,11 @@ func (c *Config) ValidateServer() error {
 	}
 	if c.Auth.PSK == "" && len(c.Auth.Clients) == 0 {
 		return fmt.Errorf("auth: at least a psk or per-client secrets are required")
+	}
+	for id := range c.Auth.Clients {
+		if !control.ValidClientID(id) {
+			return fmt.Errorf("auth: invalid client id %q (allowed: A-Z a-z 0-9 . _ -, length 1..64)", id)
+		}
 	}
 	return nil
 }

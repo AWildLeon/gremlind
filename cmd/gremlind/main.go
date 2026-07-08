@@ -98,7 +98,7 @@ func runServer(args []string) error {
 		return err
 	}
 
-	greLocal := netip.MustParseAddr(cfg.GRELocal)     // validated by ValidateServer
+	greLocal := netip.MustParseAddr(cfg.GRELocal) // validated by ValidateServer
 	serverInner := netip.MustParseAddr(cfg.ServerInner)
 	poolPrefix := netip.MustParsePrefix(cfg.InnerPool)
 
@@ -112,16 +112,19 @@ func runServer(args []string) error {
 		ServerInner: serverInner,
 		GRELocal:    greLocal,
 		MTUCap:      cfg.MTU,
+		UseGREKey:   cfg.GREKeyEnabled(),
 		UpHook:      cfg.Hooks.Up,
 		DownHook:    cfg.Hooks.Down,
 	})
 
 	srv := &control.Server{
-		Log:              log,
-		PSK:              cfg.Auth.PSK,
-		Clients:          cfg.Auth.Clients,
-		Establisher:      mgr,
-		KeepaliveTimeout: cfg.KeepaliveTimeout.Std(),
+		Log:                  log,
+		PSK:                  cfg.Auth.PSK,
+		Clients:              cfg.Auth.Clients,
+		Establisher:          mgr,
+		KeepaliveTimeout:     cfg.KeepaliveTimeout.Std(),
+		MaxPendingHandshakes: cfg.MaxPendingHandshakes,
+		MaxPendingPerIP:      cfg.MaxPendingPerIP,
 	}
 
 	ctx, stop := signalContext()
@@ -178,6 +181,9 @@ func runConnect(args []string) error {
 			return err
 		}
 	}
+	// Ensure keepalive durations are non-zero even without a config file; a zero
+	// interval would panic time.NewTicker in the keepalive loop.
+	cfg.ApplyDefaults()
 	clientID := pick(*idFlag, cfg.Client.ID)
 	secret := pick(*secretFlag, cfg.Client.Secret, cfg.Auth.PSK)
 	if clientID == "" || secret == "" {

@@ -35,6 +35,18 @@ func Response(secret, clientID string, nonce Nonce) []byte {
 	return mac.Sum(nil)
 }
 
+// ServerProof computes the server's authenticated proof over the accepted
+// session parameters. It proves the server knows the same secret and binds the
+// reply to this handshake nonce/client ID.
+func ServerProof(secret, clientID string, nonce Nonce, sessionPayload []byte) []byte {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte("gremlind server proof v1"))
+	mac.Write(nonce[:])
+	mac.Write([]byte(clientID))
+	mac.Write(sessionPayload)
+	return mac.Sum(nil)
+}
+
 // Verify reports whether got matches the expected response for secret/clientID.
 // It is constant-time.
 func Verify(secret, clientID string, nonce Nonce, got []byte) bool {
@@ -42,11 +54,33 @@ func Verify(secret, clientID string, nonce Nonce, got []byte) bool {
 	return hmac.Equal(want, got)
 }
 
-// SecretFor resolves the secret for a client: a per-client secret if present,
-// otherwise the global PSK. Returns "" if neither is configured.
+// VerifyServerProof reports whether got is the expected server proof.
+func VerifyServerProof(secret, clientID string, nonce Nonce, sessionPayload, got []byte) bool {
+	want := ServerProof(secret, clientID, nonce, sessionPayload)
+	return hmac.Equal(want, got)
+}
+
+// SecretFor resolves the secret for a client. When per-client secrets are
+// configured, only listed client IDs are accepted; the global PSK is used only
+// in legacy/global-only mode. This prevents a global PSK holder from claiming
+// arbitrary unlisted identities when a client allowlist exists.
 func SecretFor(clientID, psk string, clients map[string]string) string {
-	if s, ok := clients[clientID]; ok {
-		return s
+	if len(clients) > 0 {
+		return clients[clientID]
 	}
 	return psk
+}
+
+// RandomSecret returns an unguessable secret. It is used to authenticate an
+// unknown client ID against a random target so authentication fails uniformly —
+// exactly like a wrong credential — instead of revealing that the ID is unknown
+// (which would make valid client IDs enumerable).
+func RandomSecret() string {
+	var b [NonceLen]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// A failing CSPRNG is unrecoverable; return an empty secret, which no
+		// valid MAC can match anyway.
+		return ""
+	}
+	return string(b[:])
 }
