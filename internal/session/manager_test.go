@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"slices"
 	"testing"
+	"time"
 
 	"gremlind/internal/control"
 	"gremlind/internal/gre"
@@ -131,6 +132,22 @@ func TestNegotiateMTUClampsTinyIPv4OuterMTU(t *testing.T) {
 
 	if got := m.negotiateMTU(1); got != 576 {
 		t.Errorf("tiny v4 mtu = %d, want IPv4 minimum 576", got)
+	}
+}
+
+func TestExpiredStickyLeaseIsPurged(t *testing.T) {
+	prov := &fakeProv{}
+	m, _ := newTestManager(t, 1500, 0, prov)
+	m.leaseTTL = time.Second
+	m.leases["old"] = netip.MustParseAddr("fd00:9::42")
+	m.leaseTimes["old"] = time.Now().Add(-2 * time.Second)
+
+	m.mu.Lock()
+	m.purgeExpiredLeasesLocked(time.Now())
+	m.mu.Unlock()
+
+	if _, ok := m.leases["old"]; ok {
+		t.Fatal("expired sticky lease was not purged")
 	}
 }
 

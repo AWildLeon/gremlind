@@ -24,6 +24,7 @@ const (
 	MsgEcho           MsgType = 6 // both: keepalive
 	MsgEchoAck        MsgType = 7 // both: keepalive reply
 	MsgTeardown       MsgType = 8 // both: end the session
+	MsgEncrypted      MsgType = 9 // both: encrypted inner control frame
 )
 
 // Result codes returned in SessionReply.
@@ -74,9 +75,12 @@ type Challenge struct {
 
 func (*Challenge) Type() MsgType { return MsgChallenge }
 
-// Auth carries the client's HMAC response to a Challenge.
+// Auth carries the client's random key-exchange nonce. It intentionally no
+// longer carries a password-derived MAC: after HELLO/CHALLENGE/AUTH, all
+// session setup and keepalive traffic is AEAD-encrypted with keys derived from
+// the pre-shared secret and both nonces.
 type Auth struct {
-	MAC []byte
+	MAC []byte // kept for wire compatibility; contains the client nonce
 }
 
 func (*Auth) Type() MsgType { return MsgAuth }
@@ -126,6 +130,13 @@ type Teardown struct {
 
 func (*Teardown) Type() MsgType { return MsgTeardown }
 
+// Encrypted wraps an AEAD-encrypted inner control frame.
+type Encrypted struct {
+	Ciphertext []byte
+}
+
+func (*Encrypted) Type() MsgType { return MsgEncrypted }
+
 // newMessage returns an empty message value for a type, for decoding.
 func newMessage(t MsgType) Message {
 	switch t {
@@ -145,6 +156,8 @@ func newMessage(t MsgType) Message {
 		return &EchoAck{}
 	case MsgTeardown:
 		return &Teardown{}
+	case MsgEncrypted:
+		return &Encrypted{}
 	default:
 		return nil
 	}

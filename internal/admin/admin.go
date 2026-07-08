@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/user"
+	"strconv"
 	"time"
 
 	"gremlind/internal/session"
@@ -17,6 +19,23 @@ import (
 // Serve listens on a unix socket and writes a JSON array of the current
 // sessions to each connection. It returns when ctx is cancelled.
 func Serve(ctx context.Context, log *slog.Logger, path string, snapshot func() []session.Entry) error {
+	return ServeWithOptions(ctx, log, Options{Path: path, Mode: 0o600}, snapshot)
+}
+
+// Options controls admin socket filesystem permissions.
+type Options struct {
+	Path  string
+	Mode  os.FileMode
+	Group string
+}
+
+// ServeWithOptions is like Serve, with configurable socket mode and group.
+func ServeWithOptions(ctx context.Context, log *slog.Logger, opts Options, snapshot func() []session.Entry) error {
+	path := opts.Path
+	mode := opts.Mode
+	if mode == 0 {
+		mode = 0o600
+	}
 	// Remove only a stale unix socket from a previous run. Refuse to unlink any
 	// other filesystem object at the configured path.
 	if st, err := os.Lstat(path); err == nil {
@@ -33,7 +52,26 @@ func Serve(ctx context.Context, log *slog.Logger, path string, snapshot func() [
 	if err != nil {
 		return fmt.Errorf("admin: listen: %w", err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	if opts.Group != "" {
+		grp, err := user.LookupGroup(opts.Group)
+		if err != nil {
+			ln.Close()
+			_ = os.Remove(path)
+			return fmt.Errorf("admin: lookup group %q: %w", opts.Group, err)
+		}
+		gid, err := strconv.Atoi(grp.Gid)
+		if err != nil {
+			ln.Close()
+			_ = os.Remove(path)
+			return fmt.Errorf("admin: parse group %q gid %q: %w", opts.Group, grp.Gid, err)
+		}
+		if err := os.Chown(path, -1, gid); err != nil {
+			ln.Close()
+			_ = os.Remove(path)
+			return fmt.Errorf("admin: chown socket group: %w", err)
+		}
+	}
+	if err := os.Chmod(path, mode); err != nil {
 		ln.Close()
 		_ = os.Remove(path)
 		return fmt.Errorf("admin: chmod socket: %w", err)

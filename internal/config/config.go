@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"time"
 
 	"gremlind/internal/control"
@@ -66,6 +67,10 @@ type Config struct {
 	GREKey *bool `yaml:"gre_key"`
 	// AdminSocket is the unix socket path for `gremlind status`; "" disables it.
 	AdminSocket string `yaml:"admin_socket"`
+	// AdminSocketMode is the socket permission bits, e.g. "0600" or "0660".
+	AdminSocketMode string `yaml:"admin_socket_mode"`
+	// AdminSocketGroup optionally sets the socket group for shared read access.
+	AdminSocketGroup string `yaml:"admin_socket_group"`
 	// MaxPendingHandshakes bounds concurrent unauthenticated handshakes (server
 	// role); 0 uses a built-in default. It caps the resources an unauthenticated
 	// connection flood can pin.
@@ -77,6 +82,7 @@ type Config struct {
 
 	KeepaliveInterval Duration `yaml:"keepalive_interval"`
 	KeepaliveTimeout  Duration `yaml:"keepalive_timeout"`
+	LeaseTTL          Duration `yaml:"lease_ttl"`
 
 	Auth  Auth  `yaml:"auth"`
 	Hooks Hooks `yaml:"hooks"`
@@ -95,6 +101,8 @@ type Client struct {
 
 // DefaultListen is used when Listen is empty. It is v6-native/dual-stack.
 const DefaultListen = "[::]:4747"
+
+const MinSecretLen = 32
 
 // Load reads and validates the config at path.
 func Load(path string) (*Config, error) {
@@ -127,6 +135,12 @@ func (c *Config) ApplyDefaults() {
 	if c.KeepaliveTimeout == 0 {
 		c.KeepaliveTimeout = Duration(45 * time.Second)
 	}
+	if c.LeaseTTL == 0 {
+		c.LeaseTTL = Duration(24 * time.Hour)
+	}
+	if c.AdminSocketMode == "" {
+		c.AdminSocketMode = "0600"
+	}
 }
 
 // GREKeyEnabled reports whether GRE key fields should be used.
@@ -158,6 +172,12 @@ func (c *Config) validate() error {
 		return fmt.Errorf("keepalive_timeout (%s) must exceed keepalive_interval (%s)",
 			c.KeepaliveTimeout.Std(), c.KeepaliveInterval.Std())
 	}
+	if c.LeaseTTL.Std() < 0 {
+		return fmt.Errorf("lease_ttl must be >= 0, got %s", c.LeaseTTL.Std())
+	}
+	if _, err := c.AdminMode(); err != nil {
+		return err
+	}
 	if c.InnerPool != "" {
 		if _, err := netip.ParsePrefix(c.InnerPool); err != nil {
 			return fmt.Errorf("invalid inner_pool %q: %w", c.InnerPool, err)
@@ -169,6 +189,18 @@ func (c *Config) validate() error {
 		}
 	}
 	return nil
+}
+
+// AdminMode parses AdminSocketMode as octal permission bits.
+func (c *Config) AdminMode() (os.FileMode, error) {
+	mode, err := strconv.ParseUint(c.AdminSocketMode, 8, 32)
+	if err != nil || mode > 0o777 {
+		if err == nil {
+			err = fmt.Errorf("mode exceeds 0777")
+		}
+		return 0, fmt.Errorf("invalid admin_socket_mode %q: %w", c.AdminSocketMode, err)
+	}
+	return os.FileMode(mode), nil
 }
 
 // ValidateServer checks fields that the server role additionally requires.
@@ -196,9 +228,15 @@ func (c *Config) ValidateServer() error {
 	if c.Auth.PSK == "" && len(c.Auth.Clients) == 0 {
 		return fmt.Errorf("auth: at least a psk or per-client secrets are required")
 	}
-	for id := range c.Auth.Clients {
+	if c.Auth.PSK != "" && len(c.Auth.PSK) < MinSecretLen {
+		return fmt.Errorf("auth: psk must be at least %d bytes", MinSecretLen)
+	}
+	for id, secret := range c.Auth.Clients {
 		if !control.ValidClientID(id) {
 			return fmt.Errorf("auth: invalid client id %q (allowed: A-Z a-z 0-9 . _ -, length 1..64)", id)
+		}
+		if len(secret) < MinSecretLen {
+			return fmt.Errorf("auth: secret for client %q must be at least %d bytes", id, MinSecretLen)
 		}
 	}
 	return nil

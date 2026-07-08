@@ -115,6 +115,7 @@ func runServer(args []string) error {
 		UseGREKey:   cfg.GREKeyEnabled(),
 		UpHook:      cfg.Hooks.Up,
 		DownHook:    cfg.Hooks.Down,
+		LeaseTTL:    cfg.LeaseTTL.Std(),
 	})
 
 	srv := &control.Server{
@@ -136,8 +137,16 @@ func runServer(args []string) error {
 	}
 
 	if cfg.AdminSocket != "" {
+		adminMode, err := cfg.AdminMode()
+		if err != nil {
+			return err
+		}
 		go func() {
-			if err := admin.Serve(ctx, log, cfg.AdminSocket, mgr.Sessions); err != nil {
+			if err := admin.ServeWithOptions(ctx, log, admin.Options{
+				Path:  cfg.AdminSocket,
+				Mode:  adminMode,
+				Group: cfg.AdminSocketGroup,
+			}, mgr.Sessions); err != nil {
 				log.Warn("admin socket stopped", "err", err)
 			}
 		}()

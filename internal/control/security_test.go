@@ -108,18 +108,17 @@ func TestClientRejectsUnauthenticatedSessionReply(t *testing.T) {
 			return
 		}
 		hello := msg.(*Hello)
-		var nonce auth.Nonce
-		nonce[0] = 1
+		nonce := fixedNonce(1)
 		_ = WriteMessage(serverConn, &Challenge{Nonce: nonce})
-		if _, err := ReadMessage(br); err != nil { // Auth
+		if _, err := ReadMessage(br); err != nil { // Auth/client nonce
 			return
 		}
-		if _, err := ReadMessage(br); err != nil { // SessionRequest
+		if _, err := ReadMessage(br); err != nil { // encrypted SessionRequest bytes
 			return
 		}
 		_ = hello
-		// Missing ServerMAC: a rogue server that does not know the secret must not
-		// be able to make the client configure a tunnel.
+		// A rogue server that does not know the secret cannot produce encrypted
+		// session replies the client accepts.
 		_ = WriteMessage(serverConn, &SessionReply{
 			Result:      ResultOK,
 			ClientInner: netip.MustParseAddr("fd00:9::2"),
@@ -135,6 +134,12 @@ func TestClientRejectsUnauthenticatedSessionReply(t *testing.T) {
 	if !errors.Is(err, ErrRejected) {
 		t.Fatalf("expected ErrRejected for unauthenticated server, got %v", err)
 	}
+}
+
+func fixedNonce(first byte) auth.Nonce {
+	var n auth.Nonce
+	n[0] = first
+	return n
 }
 
 // TestOversizedHandshakePayloadRejected verifies the handshake read path rejects

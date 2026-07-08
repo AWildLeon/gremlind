@@ -184,7 +184,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn, release func()) {
 		conn.Close()
 	}()
 
-	params, grant, ok := s.handshake(ctx, conn, br, log)
+	params, grant, sec, ok := s.handshake(ctx, conn, br, log)
 	// Release the pending-handshake slots the moment the handshake resolves; an
 	// established (authenticated) session must not hold them for its whole life.
 	release()
@@ -199,12 +199,13 @@ func (s *Server) handle(ctx context.Context, conn net.Conn, release func()) {
 		log.Info("session torn down")
 	}()
 
-	s.keepaliveLoop(ctx, conn, br, log)
+	s.keepaliveLoop(ctx, conn, sec, log)
 }
 
-// handshake runs HELLO→CHALLENGE→AUTH→SESSION_REQUEST→SESSION_REPLY. It returns
+// handshake runs HELLO→CHALLENGE→AUTH, derives PSK AEAD keys, then exchanges
+// SESSION_REQUEST→SESSION_REPLY inside the encrypted channel. It returns
 // ok=false (after best-effort notifying the peer) on any failure.
-func (s *Server) handshake(ctx context.Context, conn net.Conn, br *bufio.Reader, log *slog.Logger) (SessionParams, SessionGrant, bool) {
+func (s *Server) handshake(ctx context.Context, conn net.Conn, br *bufio.Reader, log *slog.Logger) (SessionParams, SessionGrant, *secureChannel, bool) {
 	conn.SetDeadline(time.Now().Add(handshakeTimeout))
 	// Clear the handshake deadline before entering the keepalive phase; otherwise
 	// the write half stays pinned to now+handshakeTimeout and the first EchoAck
@@ -214,45 +215,56 @@ func (s *Server) handshake(ctx context.Context, conn net.Conn, br *bufio.Reader,
 
 	hello, ok := expect[*Hello](br, log, "hello")
 	if !ok {
-		return SessionParams{}, SessionGrant{}, false
+		return SessionParams{}, SessionGrant{}, nil, false
 	}
 	if !ValidClientID(hello.ClientID) {
 		log.Warn("invalid client id")
 		writeTeardown(conn, "invalid client id")
-		return SessionParams{}, SessionGrant{}, false
+		return SessionParams{}, SessionGrant{}, nil, false
 	}
 	secret := auth.SecretFor(hello.ClientID, s.PSK, s.Clients)
 	if secret == "" {
-		// Unknown client. Do not reveal it: continue the handshake against an
-		// unguessable random secret so authentication fails at the AUTH step
-		// exactly like a wrong credential, with the same generic reason. This
-		// removes a client-ID enumeration oracle.
+		// Unknown client. Do not reveal it: continue with an unguessable random
+		// secret so the next encrypted read fails exactly like a wrong credential.
 		log.Debug("unknown client id (failing uniformly)", "client", hello.ClientID)
 		secret = auth.RandomSecret()
 	}
 
-	nonce, err := auth.NewNonce()
+	serverNonce, err := auth.NewNonce()
 	if err != nil {
 		log.Error("nonce generation failed", "err", err)
-		return SessionParams{}, SessionGrant{}, false
+		return SessionParams{}, SessionGrant{}, nil, false
 	}
-	if err := WriteMessage(conn, &Challenge{Nonce: nonce}); err != nil {
-		return SessionParams{}, SessionGrant{}, false
+	if err := WriteMessage(conn, &Challenge{Nonce: serverNonce}); err != nil {
+		return SessionParams{}, SessionGrant{}, nil, false
 	}
 
 	authMsg, ok := expect[*Auth](br, log, "auth")
 	if !ok {
-		return SessionParams{}, SessionGrant{}, false
+		return SessionParams{}, SessionGrant{}, nil, false
 	}
-	if !auth.Verify(secret, hello.ClientID, nonce, authMsg.MAC) {
-		log.Warn("authentication failed", "client", hello.ClientID)
+	if len(authMsg.MAC) != auth.NonceLen {
+		log.Warn("invalid client key-exchange nonce", "client", hello.ClientID)
 		writeTeardown(conn, "authentication failed")
-		return SessionParams{}, SessionGrant{}, false
+		return SessionParams{}, SessionGrant{}, nil, false
+	}
+	var clientNonce auth.Nonce
+	copy(clientNonce[:], authMsg.MAC)
+	sec, err := newServerSecureChannel(secret, hello.ClientID, serverNonce, clientNonce, br, conn)
+	if err != nil {
+		log.Error("secure channel setup failed", "err", err)
+		return SessionParams{}, SessionGrant{}, nil, false
 	}
 
-	req, ok := expect[*SessionRequest](br, log, "session request")
+	reqMsg, err := sec.ReadMessage()
+	if err != nil {
+		log.Warn("authentication failed", "client", hello.ClientID, "err", err)
+		return SessionParams{}, SessionGrant{}, nil, false
+	}
+	req, ok := reqMsg.(*SessionRequest)
 	if !ok {
-		return SessionParams{}, SessionGrant{}, false
+		log.Warn("unexpected encrypted message", "want", "session request", "got_type", reqMsg.Type())
+		return SessionParams{}, SessionGrant{}, nil, false
 	}
 
 	clientOuter := outerAddr(conn.RemoteAddr())
@@ -270,8 +282,8 @@ func (s *Server) handshake(ctx context.Context, conn net.Conn, br *bufio.Reader,
 			msg = err.Error()
 		}
 		log.Warn("establish failed", "result", result, "err", err)
-		WriteMessage(conn, &SessionReply{Result: result, Message: msg})
-		return SessionParams{}, SessionGrant{}, false
+		_ = sec.WriteMessage(&SessionReply{Result: result, Message: msg})
+		return SessionParams{}, SessionGrant{}, nil, false
 	}
 
 	reply := &SessionReply{
@@ -282,21 +294,20 @@ func (s *Server) handshake(ctx context.Context, conn net.Conn, br *bufio.Reader,
 		GREKey:      grant.GREKey,
 		MTU:         grant.MTU,
 	}
-	reply.ServerMAC = auth.ServerProof(secret, hello.ClientID, nonce, sessionReplyProofPayload(reply))
-	if err := WriteMessage(conn, reply); err != nil {
+	if err := sec.WriteMessage(reply); err != nil {
 		s.Establisher.Teardown(params, grant)
-		return SessionParams{}, SessionGrant{}, false
+		return SessionParams{}, SessionGrant{}, nil, false
 	}
-	return params, grant, true
+	return params, grant, sec, true
 }
 
 // keepaliveLoop replies to Echo probes and drops the peer if it goes silent for
 // longer than KeepaliveTimeout. The client drives the probe cadence. The caller
 // (handle) owns the context watcher that closes conn on shutdown.
-func (s *Server) keepaliveLoop(ctx context.Context, conn net.Conn, br *bufio.Reader, log *slog.Logger) {
+func (s *Server) keepaliveLoop(ctx context.Context, conn net.Conn, sec *secureChannel, log *slog.Logger) {
 	for {
 		conn.SetReadDeadline(time.Now().Add(s.KeepaliveTimeout))
-		msg, err := ReadMessage(br)
+		msg, err := sec.ReadMessage()
 		if err != nil {
 			if !errors.Is(err, io.EOF) && ctx.Err() == nil {
 				log.Debug("control connection closed", "err", err)
@@ -305,7 +316,7 @@ func (s *Server) keepaliveLoop(ctx context.Context, conn net.Conn, br *bufio.Rea
 		}
 		switch m := msg.(type) {
 		case *Echo:
-			if err := WriteMessage(conn, &EchoAck{Seq: m.Seq}); err != nil {
+			if err := sec.WriteMessage(&EchoAck{Seq: m.Seq}); err != nil {
 				return
 			}
 		case *Teardown:

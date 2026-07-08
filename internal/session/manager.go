@@ -55,11 +55,13 @@ type Manager struct {
 	useGREKey   bool // whether to set GRE key fields; false = plain GRE
 	upHook      string
 	downHook    string
+	leaseTTL    time.Duration
 
-	mu       sync.Mutex
-	sessions map[uint32]*Entry     // active sessions keyed by GRE key
-	active   map[string]uint32     // client ID -> its current session key
-	leases   map[string]netip.Addr // client ID -> last inner address (sticky)
+	mu         sync.Mutex
+	sessions   map[uint32]*Entry     // active sessions keyed by GRE key
+	active     map[string]uint32     // client ID -> its current session key
+	leases     map[string]netip.Addr // client ID -> last inner address (sticky)
+	leaseTimes map[string]time.Time  // last time the sticky lease was refreshed
 }
 
 // Config parameterizes the manager.
@@ -68,11 +70,12 @@ type Config struct {
 	Pool        *ippool.Pool
 	ServerInner netip.Addr
 	GRELocal    netip.Addr
-	OuterMTU    int    // server's outer link MTU (0 = auto-detect)
-	MTUCap      int    // config.MTU
-	UseGREKey   bool   // true = keyed GRE; false = no GRE key field
-	UpHook      string // script run when a session interface comes up
-	DownHook    string // script run when a session interface goes down
+	OuterMTU    int           // server's outer link MTU (0 = auto-detect)
+	MTUCap      int           // config.MTU
+	UseGREKey   bool          // true = keyed GRE; false = no GRE key field
+	UpHook      string        // script run when a session interface comes up
+	DownHook    string        // script run when a session interface goes down
+	LeaseTTL    time.Duration // sticky lease lifetime after last use; 0 disables expiry
 }
 
 // New builds a Manager using the real netlink data-plane.
@@ -101,9 +104,11 @@ func newWith(cfg Config, prov Provisioner) *Manager {
 		useGREKey:   cfg.UseGREKey,
 		upHook:      cfg.UpHook,
 		downHook:    cfg.DownHook,
+		leaseTTL:    cfg.LeaseTTL,
 		sessions:    make(map[uint32]*Entry),
 		active:      make(map[string]uint32),
 		leases:      make(map[string]netip.Addr),
+		leaseTimes:  make(map[string]time.Time),
 	}
 }
 
@@ -123,6 +128,7 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 	// the client reconnected, likely from a new outer IP), then assign the inner
 	// address, preferring the client's sticky lease so it keeps the same IP.
 	m.mu.Lock()
+	m.purgeExpiredLeasesLocked(time.Now())
 	evicted := m.evictLocked(p.ClientID)
 	clientInner, err := m.allocInnerLocked(p.ClientID, p.RequestedInner)
 	if err != nil {
@@ -152,6 +158,7 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 	m.sessions[sessionKey] = entry
 	m.active[p.ClientID] = sessionKey
 	m.leases[p.ClientID] = clientInner
+	m.leaseTimes[p.ClientID] = entry.Since
 	m.mu.Unlock()
 
 	// Data-plane and hooks run outside the lock.
@@ -178,6 +185,8 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 				delete(m.active, p.ClientID)
 			}
 			m.pool.Release(clientInner)
+			delete(m.leases, p.ClientID)
+			delete(m.leaseTimes, p.ClientID)
 		}
 		m.mu.Unlock()
 		return control.SessionGrant{}, control.ResultInternal, err
@@ -221,6 +230,7 @@ func (m *Manager) Teardown(_ control.SessionParams, g control.SessionGrant) {
 		delete(m.active, entry.ClientID)
 	}
 	m.pool.Release(entry.ClientInner) // lease is kept for sticky reconnect
+	m.leaseTimes[entry.ClientID] = time.Now()
 	m.mu.Unlock()
 
 	m.removeAndNotify(entry)
@@ -308,6 +318,23 @@ func (m *Manager) ifName(key uint32) string {
 		return "grem"
 	}
 	return fmt.Sprintf("grem%x", key)
+}
+
+// purgeExpiredLeasesLocked drops inactive sticky leases after the configured
+// lifetime. Active sessions are never purged. Caller must hold m.mu.
+func (m *Manager) purgeExpiredLeasesLocked(now time.Time) {
+	if m.leaseTTL <= 0 {
+		return
+	}
+	for clientID, t := range m.leaseTimes {
+		if _, active := m.active[clientID]; active {
+			continue
+		}
+		if now.Sub(t) > m.leaseTTL {
+			delete(m.leases, clientID)
+			delete(m.leaseTimes, clientID)
+		}
+	}
 }
 
 // randomKeyLocked returns a fresh unpredictable non-zero GRE key. Caller must

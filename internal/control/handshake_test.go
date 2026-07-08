@@ -117,11 +117,11 @@ func TestKeepaliveSurvivesHandshakeDeadline(t *testing.T) {
 	// deadline would already have expired on the server side.
 	time.Sleep(200 * time.Millisecond)
 
-	if err := WriteMessage(conn, &Echo{Seq: 7}); err != nil {
+	if err := cl.sec.WriteMessage(&Echo{Seq: 7}); err != nil {
 		t.Fatalf("write echo: %v", err)
 	}
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	msg, err := ReadMessage(cl.br)
+	msg, err := cl.sec.ReadMessage()
 	if err != nil {
 		t.Fatalf("expected EchoAck after handshake deadline, got: %v", err)
 	}

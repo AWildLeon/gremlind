@@ -18,8 +18,11 @@ mtu: 0
 # false for plain GRE without keys. Keys are not an authentication mechanism.
 gre_key: true
 
-# Unix socket for `gremlind status`. Empty string disables it.
+# Unix socket for `gremlind status`. Empty string disables it. Default mode is
+# private (0600); use 0660 plus a group for shared operator read access.
 admin_socket: "/run/gremlind.sock"
+admin_socket_mode: "0600"
+admin_socket_group: ""
 
 # DoS hardening: bound how many connections may be mid-handshake (accepted but
 # not yet authenticated) at once — globally and per source IP. Beyond the limit
@@ -30,6 +33,10 @@ max_pending_per_ip: 0
 
 keepalive_interval: 15s
 keepalive_timeout: 45s
+
+# Sticky per-client inner-address leases expire after this time once inactive.
+# Set to 0s to keep old leases until daemon restart.
+lease_ttl: 24h
 
 auth:
   # Use a high-entropy secret; the HMAC handshake is resistant to passive replay

@@ -39,13 +39,15 @@ type Client struct {
 	KeepaliveInterval time.Duration
 	KeepaliveTimeout  time.Duration
 
-	// br is the buffered reader established during Handshake and reused by
-	// KeepaliveLoop so no buffered bytes are lost between the two phases.
-	br *bufio.Reader
+	// br/sec are established during Handshake and reused by KeepaliveLoop so no
+	// buffered bytes are lost between phases and all post-handshake traffic stays
+	// encrypted.
+	br  *bufio.Reader
+	sec *secureChannel
 }
 
-// Handshake runs the client half of HELLO→AUTH→SESSION over an established
-// connection and returns the negotiated session.
+// Handshake runs the client half of HELLO→AUTH, derives PSK AEAD keys, then
+// completes session setup over the encrypted channel.
 func (c *Client) Handshake(conn net.Conn) (*Session, error) {
 	if !ValidClientID(c.ClientID) {
 		return nil, fmt.Errorf("invalid client id %q", c.ClientID)
@@ -71,21 +73,29 @@ func (c *Client) Handshake(conn net.Conn) (*Session, error) {
 		return nil, fmt.Errorf("expected challenge, got type %d", chMsg.Type())
 	}
 
-	mac := auth.Response(c.Secret, c.ClientID, challenge.Nonce)
-	if err := WriteMessage(conn, &Auth{MAC: mac}); err != nil {
+	clientNonce, err := auth.NewNonce()
+	if err != nil {
+		return nil, fmt.Errorf("generate client nonce: %w", err)
+	}
+	if err := WriteMessage(conn, &Auth{MAC: clientNonce[:]}); err != nil {
 		return nil, fmt.Errorf("send auth: %w", err)
 	}
+	sec, err := newClientSecureChannel(c.Secret, c.ClientID, challenge.Nonce, clientNonce, br, conn)
+	if err != nil {
+		return nil, fmt.Errorf("secure channel setup: %w", err)
+	}
+	c.sec = sec
 
-	if err := WriteMessage(conn, &SessionRequest{
+	if err := sec.WriteMessage(&SessionRequest{
 		OuterMTU:       c.OuterMTU,
 		RequestedInner: c.RequestedInner,
 	}); err != nil {
 		return nil, fmt.Errorf("send session request: %w", err)
 	}
 
-	replyMsg, err := ReadMessage(br)
+	replyMsg, err := sec.ReadMessage()
 	if err != nil {
-		return nil, fmt.Errorf("read session reply: %w", err)
+		return nil, fmt.Errorf("%w: server authentication failed", ErrRejected)
 	}
 	switch m := replyMsg.(type) {
 	case *SessionReply:
@@ -95,9 +105,6 @@ func (c *Client) Handshake(conn net.Conn) (*Session, error) {
 				return nil, fmt.Errorf("session rejected: %s (%s)", m.Result, m.Message)
 			}
 			return nil, fmt.Errorf("%w: %s (%s)", ErrRejected, m.Result, m.Message)
-		}
-		if !auth.VerifyServerProof(c.Secret, c.ClientID, challenge.Nonce, sessionReplyProofPayload(m), m.ServerMAC) {
-			return nil, fmt.Errorf("%w: server authentication failed", ErrRejected)
 		}
 		return &Session{
 			ClientInner: m.ClientInner,
@@ -117,9 +124,9 @@ func (c *Client) Handshake(conn net.Conn) (*Session, error) {
 // is cancelled or the connection fails. It reuses the same bufio.Reader the
 // Handshake used implicitly, so callers must not read from conn concurrently.
 func (c *Client) KeepaliveLoop(ctx context.Context, conn net.Conn) error {
-	br := c.br
-	if br == nil {
-		br = bufio.NewReader(conn)
+	sec := c.sec
+	if sec == nil {
+		return fmt.Errorf("secure channel is not established")
 	}
 
 	// Derive a context cancelled when this loop returns, so the helper goroutines
@@ -139,7 +146,7 @@ func (c *Client) KeepaliveLoop(ctx context.Context, conn net.Conn) error {
 				return
 			case <-ticker.C:
 				seq++
-				if err := WriteMessage(conn, &Echo{Seq: seq}); err != nil {
+				if err := sec.WriteMessage(&Echo{Seq: seq}); err != nil {
 					sendErr <- err
 					return
 				}
@@ -152,7 +159,7 @@ func (c *Client) KeepaliveLoop(ctx context.Context, conn net.Conn) error {
 		// Announce shutdown to the server only on a genuine parent cancellation;
 		// on a dropped connection the write would just fail harmlessly.
 		if ctx.Err() != nil {
-			WriteMessage(conn, &Teardown{Reason: "client shutdown"})
+			_ = sec.WriteMessage(&Teardown{Reason: "client shutdown"})
 		}
 		conn.Close()
 	}()
@@ -164,7 +171,7 @@ func (c *Client) KeepaliveLoop(ctx context.Context, conn net.Conn) error {
 			return err
 		default:
 		}
-		msg, err := ReadMessage(br)
+		msg, err := sec.ReadMessage()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil

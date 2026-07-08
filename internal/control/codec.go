@@ -345,3 +345,15 @@ func (m *Teardown) unmarshalPayload(b []byte) error {
 	m.Reason = d.str()
 	return d.finish()
 }
+
+func (m *Encrypted) marshalPayload() []byte {
+	e := &enc{}
+	e.bytes(m.Ciphertext)
+	return e.b
+}
+
+func (m *Encrypted) unmarshalPayload(b []byte) error {
+	d := &dec{b: b}
+	m.Ciphertext = d.bytes()
+	return d.finish()
+}
