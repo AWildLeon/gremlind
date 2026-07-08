@@ -287,6 +287,7 @@ func (m *SessionReply) marshalPayload() []byte {
 	e.addr(m.ServerInner)
 	e.addr(m.ServerOuter)
 	e.u32(m.GREKey)
+	e.u32(m.TunnelFlags)
 	e.u16(m.MTU)
 	e.str(m.Message)
 	e.bytes(m.ServerMAC)
@@ -300,6 +301,7 @@ func (m *SessionReply) unmarshalPayload(b []byte) error {
 	m.ServerInner = d.addr()
 	m.ServerOuter = d.addr()
 	m.GREKey = d.u32()
+	m.TunnelFlags = d.u32()
 	m.MTU = d.u16()
 	m.Message = d.str()
 	m.ServerMAC = d.bytes()
@@ -315,6 +317,7 @@ func sessionReplyProofPayload(m *SessionReply) []byte {
 	e.addr(m.ServerInner)
 	e.addr(m.ServerOuter)
 	e.u32(m.GREKey)
+	e.u32(m.TunnelFlags)
 	e.u16(m.MTU)
 	return e.b
 }

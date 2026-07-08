@@ -29,6 +29,7 @@ type Params struct {
 	Local      netip.Addr // outer local endpoint
 	Remote     netip.Addr // outer remote endpoint
 	Key        uint32     // GRE key (I/O); zero disables GRE key fields
+	Seq        bool       // enable GRE sequence number fields (both directions)
 	MTU        int        // interface MTU (negotiated)
 	InnerLocal netip.Addr // inner address assigned on this interface
 	InnerPeer  netip.Addr // inner address of the tunnel peer (routed on-link)
@@ -38,9 +39,19 @@ type Params struct {
 // Overhead returns the per-packet encapsulation overhead in bytes for an outer
 // endpoint of the given family. keyed defaults to true for compatibility.
 func Overhead(outer netip.Addr, keyed ...bool) int {
+	useKey := len(keyed) == 0 || keyed[0]
+	return OverheadWithOptions(outer, useKey, false)
+}
+
+// OverheadWithOptions returns the GRE+outer-IP overhead for explicit GRE key and
+// sequence-number settings.
+func OverheadWithOptions(outer netip.Addr, keyed, seq bool) int {
 	greHeader := 4 // base GRE header
-	if len(keyed) == 0 || keyed[0] {
+	if keyed {
 		greHeader += 4 // key field
+	}
+	if seq {
+		greHeader += 4 // sequence-number field
 	}
 	if outer.Is6() {
 		return 40 + greHeader // IPv6 outer header

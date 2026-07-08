@@ -25,6 +25,7 @@ type Session struct {
 	ServerInner netip.Addr
 	ServerOuter netip.Addr
 	GREKey      uint32
+	TunnelFlags uint32
 	MTU         uint16
 }
 
@@ -106,11 +107,22 @@ func (c *Client) Handshake(conn net.Conn) (*Session, error) {
 			}
 			return nil, fmt.Errorf("%w: %s (%s)", ErrRejected, m.Result, m.Message)
 		}
+		if unknown := m.TunnelFlags &^ (TunnelFlagGREKey | TunnelFlagGRESeq); unknown != 0 {
+			return nil, fmt.Errorf("%w: server selected unknown tunnel flags 0x%x", ErrRejected, unknown)
+		}
+		greKey := uint32(0)
+		if m.TunnelFlags&TunnelFlagGREKey != 0 {
+			if m.GREKey == 0 {
+				return nil, fmt.Errorf("%w: server selected GRE keys without a key", ErrRejected)
+			}
+			greKey = m.GREKey
+		}
 		return &Session{
 			ClientInner: m.ClientInner,
 			ServerInner: m.ServerInner,
 			ServerOuter: m.ServerOuter,
-			GREKey:      m.GREKey,
+			GREKey:      greKey,
+			TunnelFlags: m.TunnelFlags,
 			MTU:         m.MTU,
 		}, nil
 	case *Teardown:

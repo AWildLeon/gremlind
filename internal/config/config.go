@@ -65,6 +65,9 @@ type Config struct {
 	// GREKey controls whether tunnels use GRE key fields for demux. nil defaults
 	// to enabled; false creates plain GRE tunnels without keys.
 	GREKey *bool `yaml:"gre_key"`
+	// GRESeq controls whether tunnels use GRE sequence-number fields. nil defaults
+	// to disabled; both peers use the server's negotiated value.
+	GRESeq *bool `yaml:"gre_seq"`
 	// AdminSocket is the unix socket path for `gremlind status`; "" disables it.
 	AdminSocket string `yaml:"admin_socket"`
 	// AdminSocketMode is the socket permission bits, e.g. "0600" or "0660".
@@ -156,6 +159,9 @@ func (c *Config) ApplyDefaults() {
 
 // GREKeyEnabled reports whether GRE key fields should be used.
 func (c *Config) GREKeyEnabled() bool { return c.GREKey == nil || *c.GREKey }
+
+// GRESeqEnabled reports whether GRE sequence-number fields should be used.
+func (c *Config) GRESeqEnabled() bool { return c.GRESeq != nil && *c.GRESeq }
 
 // validate performs role-agnostic checks. Fields only required by the server
 // role (pool, gre_local) are validated when present; the server startup path

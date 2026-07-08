@@ -53,6 +53,7 @@ type Manager struct {
 	outerMTU    int
 	mtuCap      int  // hard upper bound from config; 0 = none
 	useGREKey   bool // whether to set GRE key fields; false = plain GRE
+	useGRESeq   bool // whether to set GRE sequence-number fields
 	upHook      string
 	downHook    string
 	leaseTTL    time.Duration
@@ -73,6 +74,7 @@ type Config struct {
 	OuterMTU    int           // server's outer link MTU (0 = auto-detect)
 	MTUCap      int           // config.MTU
 	UseGREKey   bool          // true = keyed GRE; false = no GRE key field
+	UseGRESeq   bool          // true = GRE sequence-number fields
 	UpHook      string        // script run when a session interface comes up
 	DownHook    string        // script run when a session interface goes down
 	LeaseTTL    time.Duration // sticky lease lifetime after last use; 0 disables expiry
@@ -108,6 +110,7 @@ func newWith(cfg Config, prov Provisioner) *Manager {
 		outerMTU:    outer,
 		mtuCap:      cfg.MTUCap,
 		useGREKey:   cfg.UseGREKey,
+		useGRESeq:   cfg.UseGRESeq,
 		upHook:      cfg.UpHook,
 		downHook:    cfg.DownHook,
 		leaseTTL:    cfg.LeaseTTL,
@@ -151,6 +154,13 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 	if m.useGREKey {
 		greKey = sessionKey
 	}
+	tunnelFlags := uint32(0)
+	if m.useGREKey {
+		tunnelFlags |= control.TunnelFlagGREKey
+	}
+	if m.useGRESeq {
+		tunnelFlags |= control.TunnelFlagGRESeq
+	}
 	ifName := m.ifName(sessionKey)
 	entry := &Entry{
 		ClientID:    p.ClientID,
@@ -179,6 +189,7 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 		Local:      m.greLocal,
 		Remote:     p.ClientOuter,
 		Key:        greKey,
+		Seq:        m.useGRESeq,
 		MTU:        mtu,
 		InnerLocal: m.serverInner,
 		InnerPeer:  clientInner,
@@ -215,6 +226,7 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 		ServerInner: m.serverInner,
 		ServerOuter: m.greLocal,
 		GREKey:      greKey,
+		TunnelFlags: tunnelFlags,
 		MTU:         uint16(mtu),
 		SessionKey:  sessionKey,
 	}, control.ResultOK, nil
@@ -287,7 +299,7 @@ func (m *Manager) negotiateMTU(clientOuterMTU int) int {
 	if clientOuterMTU > 0 && clientOuterMTU < outer {
 		outer = clientOuterMTU
 	}
-	mtu := outer - gre.Overhead(m.greLocal, m.useGREKey)
+	mtu := outer - gre.OverheadWithOptions(m.greLocal, m.useGREKey, m.useGRESeq)
 	if m.mtuCap > 0 && m.mtuCap < mtu {
 		mtu = m.mtuCap
 	}

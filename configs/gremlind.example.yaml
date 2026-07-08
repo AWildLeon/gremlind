@@ -17,6 +17,9 @@ mtu: 0
 # Use GRE key fields as a demultiplexing identifier (like a port number). Set to
 # false for plain GRE without keys. Keys are not an authentication mechanism.
 gre_key: true
+# GRE sequence numbers add per-packet sequence fields. Usually leave off unless
+# both your kernel/path need them; the server's setting wins for clients.
+gre_seq: false
 
 # Unix socket for `gremlind status`. Empty string disables it. Default mode is
 # private (0600); use 0660 plus a group for shared operator read access.

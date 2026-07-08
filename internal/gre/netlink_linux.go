@@ -31,6 +31,7 @@ const (
 	iflaGreLocal  = 6
 	iflaGreRemote = 7
 
+	greSeqFlag = 0x1000 // GRE_SEQ flag in the GRE header flags field
 	greKeyFlag = 0x2000 // GRE_KEY flag in the GRE header flags field
 )
 
@@ -332,11 +333,18 @@ func createGRE(p Params) error {
 	li := m.beginNested(unix.IFLA_LINKINFO)
 	m.attr(unix.IFLA_INFO_KIND, nameAttr(kind))
 	data := m.beginNested(unix.IFLA_INFO_DATA)
+	flags := uint16(0)
 	if p.Key != 0 {
 		m.attr(iflaGreIKey, beU32(p.Key))
 		m.attr(iflaGreOKey, beU32(p.Key))
-		m.attr(iflaGreIFlags, beU16(greKeyFlag))
-		m.attr(iflaGreOFlags, beU16(greKeyFlag))
+		flags |= greKeyFlag
+	}
+	if p.Seq {
+		flags |= greSeqFlag
+	}
+	if flags != 0 {
+		m.attr(iflaGreIFlags, beU16(flags))
+		m.attr(iflaGreOFlags, beU16(flags))
 	}
 	m.attr(iflaGreLocal, p.Local.AsSlice())
 	m.attr(iflaGreRemote, p.Remote.AsSlice())

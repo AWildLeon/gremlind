@@ -27,6 +27,7 @@ func TestFrameRoundtrip(t *testing.T) {
 			ServerInner: netip.MustParseAddr("fd00:9::1"),
 			ServerOuter: netip.MustParseAddr("2001:db8::10"),
 			GREKey:      0xdeadbeef,
+			TunnelFlags: TunnelFlagGREKey | TunnelFlagGRESeq,
 			MTU:         1400,
 			Message:     "ok",
 		},

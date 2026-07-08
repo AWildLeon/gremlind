@@ -40,6 +40,18 @@ func TestGREKeyEnabledDefaultsToTrue(t *testing.T) {
 	}
 }
 
+func TestGRESeqEnabledDefaultsToFalse(t *testing.T) {
+	c := &Config{}
+	if c.GRESeqEnabled() {
+		t.Fatal("GRESeqEnabled should default to false")
+	}
+	v := true
+	c.GRESeq = &v
+	if !c.GRESeqEnabled() {
+		t.Fatal("GRESeqEnabled should honor explicit true")
+	}
+}
+
 func TestLoadDecoyOptions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gremlind.yaml")
 	if err := os.WriteFile(path, []byte(`
@@ -49,6 +61,7 @@ keepalive_timeout: 45s
 decoy_redirect: "/"
 gremlinmusthide: true
 netlink_socket: "/run/gremlind-netlink.sock"
+gre_seq: true
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -65,6 +78,9 @@ netlink_socket: "/run/gremlind-netlink.sock"
 	}
 	if c.NetlinkSocket != "/run/gremlind-netlink.sock" {
 		t.Fatalf("netlink_socket = %q, want /run/gremlind-netlink.sock", c.NetlinkSocket)
+	}
+	if !c.GRESeqEnabled() {
+		t.Fatal("gre_seq = false, want true")
 	}
 }
 

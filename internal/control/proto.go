@@ -31,6 +31,11 @@ const (
 type Result uint8
 
 const (
+	TunnelFlagGREKey uint32 = 1 << iota
+	TunnelFlagGRESeq
+)
+
+const (
 	ResultOK          Result = 0
 	ResultAuthFailed  Result = 1
 	ResultNoAddresses Result = 2 // inner pool exhausted
@@ -114,6 +119,7 @@ type SessionReply struct {
 	ServerInner netip.Addr // server's inner address (tunnel peer)
 	ServerOuter netip.Addr // server's outer GRE endpoint
 	GREKey      uint32     // GRE key demultiplexing this session
+	TunnelFlags uint32     // effective GRE options selected by server
 	MTU         uint16     // negotiated tunnel MTU (both peers set this)
 	Message     string     // human-readable detail, esp. on failure
 	ServerMAC   []byte     // HMAC proof over successful replies

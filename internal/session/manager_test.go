@@ -106,6 +106,31 @@ func TestEstablishCanDisableGREKeys(t *testing.T) {
 	}
 }
 
+func TestEstablishCanEnableGRESequenceNumbers(t *testing.T) {
+	prov := &fakeProv{}
+	m, _ := newTestManager(t, 1500, 0, prov)
+	m.useGRESeq = true
+
+	grant, res, err := m.Establish(context.Background(), control.SessionParams{
+		ClientID:    "site-a",
+		ClientOuter: netip.MustParseAddr("2001:db8::20"),
+		OuterMTU:    1500,
+	})
+	if err != nil || res != control.ResultOK {
+		t.Fatalf("establish: res=%s err=%v", res, err)
+	}
+	if grant.TunnelFlags&control.TunnelFlagGRESeq == 0 {
+		t.Fatalf("TunnelFlags = 0x%x, want GRE seq", grant.TunnelFlags)
+	}
+	if len(prov.ensured) != 1 || !prov.ensured[0].Seq {
+		t.Fatalf("provisioned params = %+v, want Seq", prov.ensured)
+	}
+	// v6 outer overhead = 40 + base GRE 4 + key 4 + seq 4 = 52 → 1448.
+	if grant.MTU != 1448 {
+		t.Fatalf("MTU = %d, want 1448", grant.MTU)
+	}
+}
+
 func TestNegotiateMTUTakesMinimumAndCap(t *testing.T) {
 	prov := &fakeProv{}
 	m, _ := newTestManager(t, 1500, 1400, prov)

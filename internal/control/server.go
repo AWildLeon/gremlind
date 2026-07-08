@@ -51,6 +51,7 @@ type SessionGrant struct {
 	ServerInner netip.Addr
 	ServerOuter netip.Addr
 	GREKey      uint32
+	TunnelFlags uint32
 	MTU         uint16
 	SessionKey  uint32 // server-local registry key, not sent on the wire
 }
@@ -307,12 +308,19 @@ func (s *Server) handshake(ctx context.Context, conn net.Conn, br *bufio.Reader,
 		return SessionParams{}, SessionGrant{}, nil, false
 	}
 
+	tunnelFlags := grant.TunnelFlags
+	if tunnelFlags == 0 && grant.GREKey != 0 {
+		// Compatibility for simple Establisher implementations/tests: a non-zero
+		// GREKey means keyed GRE unless explicit flags say otherwise.
+		tunnelFlags = TunnelFlagGREKey
+	}
 	reply := &SessionReply{
 		Result:      ResultOK,
 		ClientInner: grant.ClientInner,
 		ServerInner: grant.ServerInner,
 		ServerOuter: grant.ServerOuter,
 		GREKey:      grant.GREKey,
+		TunnelFlags: tunnelFlags,
 		MTU:         grant.MTU,
 	}
 	if err := sec.WriteMessage(reply); err != nil {
