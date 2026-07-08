@@ -29,7 +29,7 @@ SRV_OUTER="2001:db8::10"
 CLI_OUTER="2001:db8::20"
 SRV_INNER="fd00:9::1"
 PORT=4747
-PSK="testkey"
+PSK="testkey-testkey-testkey-testkey-32"
 
 workdir="$(mktemp -d)"
 cleanup() {
@@ -60,7 +60,7 @@ cns ip link set veth-c up
 cns ip link set lo up
 
 cat >"$workdir/up-hook.sh" <<EOF
-#!/usr/bin/env bash
+#!$(command -v bash)
 echo "hook-fired iface=\$GREMLIND_IFACE client=\$GREMLIND_CLIENT_ID inner=\$GREMLIND_INNER_PEER" > "$workdir/hook.log"
 EOF
 chmod +x "$workdir/up-hook.sh"
