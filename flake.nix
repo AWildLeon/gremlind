@@ -175,19 +175,21 @@
 
           config =
             let
-              instances = lib.filterAttrs (_: icfg: icfg.enable) config.services.gremlind;
-
-              mkInstance = name: cfg:
+              # Per-instance derived values, keyed by name — kept out of the
+              # config.* tree itself (see the note below on why the
+              # config.{assertions,users.groups,systemd.services} generators
+              # are three separate mapAttrsToList/mkMerge passes instead of
+              # one merged per-instance attrset).
+              instanceData = lib.mapAttrs (
+                name: cfg:
                 let
                   runtimeDir = "gremlind-${name}";
                   configPath = "/run/${runtimeDir}/config.yaml";
                   settingsFile = settingsFormat.generate "gremlind-${name}-settings.yaml" cfg.settings;
-
                   loadCredentials =
                     lib.optional (cfg.auth.pskFile != null) "psk:${cfg.auth.pskFile}"
                     ++ lib.mapAttrsToList (id: file: "client-${id}:${file}") cfg.auth.clients
                     ++ lib.optional (cfg.client.secretFile != null) "secret:${cfg.client.secretFile}";
-
                   renderConfig = pkgs.writeShellScript "gremlind-${name}-render-config" ''
                     set -eu
                     umask 077
@@ -216,92 +218,120 @@
                     ''}
                   '';
                 in
-                {
-                  assertions = [
-                    {
-                      assertion = cfg.role != "connect" || cfg.connectTo != null;
-                      message = "services.gremlind.${name}.connectTo is required when role = connect.";
-                    }
-                  ];
-
-                  users.groups = lib.mkIf cfg.netlinkd.enable { ${cfg.netlinkd.group} = { }; };
-
-                  systemd.services."gremlind-${name}" = {
-                    description = "gremlind GRE control-plane daemon (${name})";
-                    wantedBy = [ "multi-user.target" ];
-                    after = [ "network-online.target" ] ++ lib.optional cfg.netlinkd.enable "gremlind-${name}-netlinkd.service";
-                    wants = [ "network-online.target" ] ++ lib.optional cfg.netlinkd.enable "gremlind-${name}-netlinkd.service";
-                    serviceConfig = {
-                      RuntimeDirectory = runtimeDir;
-                      LoadCredential = loadCredentials;
-                      ExecStartPre = "${renderConfig}";
-                      ExecStart =
-                        if cfg.role == "server" then
-                          "${lib.getExe cfg.package} server -c ${configPath}"
-                        else
-                          "${lib.getExe cfg.package} connect ${cfg.connectTo} -c ${configPath}";
-                      Restart = "on-failure";
-                      RestartSec = 3;
-                      UMask = "0077";
-                      AmbientCapabilities = lib.optional (!cfg.netlinkd.enable) "CAP_NET_ADMIN";
-                      CapabilityBoundingSet = lib.optional (!cfg.netlinkd.enable) "CAP_NET_ADMIN";
-                      NoNewPrivileges = true;
-                      DynamicUser = true;
-                      SupplementaryGroups = lib.optional cfg.netlinkd.enable cfg.netlinkd.group;
-                      PrivateTmp = true;
-                      LockPersonality = true;
-                      MemoryDenyWriteExecute = true;
-                      ProtectSystem = "strict";
-                      ProtectHome = true;
-                      ProtectClock = true;
-                      ProtectControlGroups = true;
-                      ProtectKernelLogs = true;
-                      ProtectKernelModules = true;
-                      ProtectKernelTunables = true;
-                      RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ] ++ lib.optional (!cfg.netlinkd.enable) "AF_NETLINK";
-                      RestrictNamespaces = true;
-                      RestrictRealtime = true;
-                      SystemCallArchitectures = "native";
-                      SystemCallFilter = [ "~@mount" "~@swap" "~@reboot" "~@obsolete" "~@cpu-emulation" "~@debug" "~@module" "~keyctl" "~bpf" ];
-                    };
-                  };
-
-                  systemd.services."gremlind-${name}-netlinkd" = lib.mkIf cfg.netlinkd.enable {
-                    description = "gremlind privileged netlink broker (${name})";
-                    wantedBy = [ "multi-user.target" ];
-                    after = [ "network-online.target" ];
-                    wants = [ "network-online.target" ];
-                    serviceConfig = {
-                      ExecStart = "${lib.getExe cfg.package} netlinkd -s ${cfg.netlinkd.socket} -mode 0660 -group ${cfg.netlinkd.group}"
-                        + lib.optionalString (cfg.netlinkd.greLocal != null) " -gre-local ${cfg.netlinkd.greLocal}";
-                      Restart = "on-failure";
-                      RestartSec = 3;
-                      UMask = "0077";
-                      AmbientCapabilities = [ "CAP_NET_ADMIN" ];
-                      CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
-                      NoNewPrivileges = true;
-                      DynamicUser = true;
-                      SupplementaryGroups = [ cfg.netlinkd.group ];
-                      PrivateTmp = true;
-                      LockPersonality = true;
-                      MemoryDenyWriteExecute = true;
-                      ProtectSystem = "strict";
-                      ProtectHome = true;
-                      ProtectClock = true;
-                      ProtectControlGroups = true;
-                      ProtectKernelLogs = true;
-                      ProtectKernelModules = true;
-                      ProtectKernelTunables = true;
-                      RestrictAddressFamilies = [ "AF_NETLINK" "AF_UNIX" ];
-                      RestrictNamespaces = true;
-                      RestrictRealtime = true;
-                      SystemCallArchitectures = "native";
-                      SystemCallFilter = [ "~@mount" "~@swap" "~@reboot" "~@obsolete" "~@cpu-emulation" "~@debug" "~@module" "~keyctl" "~bpf" ];
-                    };
-                  };
-                };
+                { inherit runtimeDir configPath loadCredentials renderConfig; }
+              ) config.services.gremlind;
             in
-            lib.mkMerge (lib.mapAttrsToList mkInstance instances);
+            {
+              # A module's own `config` value can't be built as one merged
+              # per-instance attrset (`mkMerge (mapAttrsToList mkInstance
+              # cfg)` spanning assertions/users.groups/systemd.services
+              # together) — evalModules' freeform/unmatched-definitions check
+              # ends up forcing that merge while it's still being computed,
+              # which is an infinite recursion. Building each config.* leaf
+              # with its own mapAttrsToList/mkMerge pass instead sidesteps it.
+              assertions = lib.concatLists (
+                lib.mapAttrsToList (
+                  name: cfg:
+                  lib.optional cfg.enable {
+                    assertion = cfg.role != "connect" || cfg.connectTo != null;
+                    message = "services.gremlind.${name}.connectTo is required when role = connect.";
+                  }
+                ) config.services.gremlind
+              );
+
+              users.groups = lib.mkMerge (
+                lib.mapAttrsToList (
+                  _: cfg: lib.mkIf (cfg.enable && cfg.netlinkd.enable) { ${cfg.netlinkd.group} = { }; }
+                ) config.services.gremlind
+              );
+
+              systemd.services = lib.mkMerge (
+                lib.mapAttrsToList (
+                  name: cfg:
+                  lib.mkIf cfg.enable (
+                    let
+                      inherit (instanceData.${name}) runtimeDir configPath loadCredentials renderConfig;
+                    in
+                    {
+                      "gremlind-${name}" = {
+                        description = "gremlind GRE control-plane daemon (${name})";
+                        wantedBy = [ "multi-user.target" ];
+                        after = [ "network-online.target" ] ++ lib.optional cfg.netlinkd.enable "gremlind-${name}-netlinkd.service";
+                        wants = [ "network-online.target" ] ++ lib.optional cfg.netlinkd.enable "gremlind-${name}-netlinkd.service";
+                        serviceConfig = {
+                          RuntimeDirectory = runtimeDir;
+                          LoadCredential = loadCredentials;
+                          ExecStartPre = "${renderConfig}";
+                          ExecStart =
+                            if cfg.role == "server" then
+                              "${lib.getExe cfg.package} server -c ${configPath}"
+                            else
+                              "${lib.getExe cfg.package} connect ${cfg.connectTo} -c ${configPath}";
+                          Restart = "on-failure";
+                          RestartSec = 3;
+                          UMask = "0077";
+                          AmbientCapabilities = lib.optional (!cfg.netlinkd.enable) "CAP_NET_ADMIN";
+                          CapabilityBoundingSet = lib.optional (!cfg.netlinkd.enable) "CAP_NET_ADMIN";
+                          NoNewPrivileges = true;
+                          DynamicUser = true;
+                          SupplementaryGroups = lib.optional cfg.netlinkd.enable cfg.netlinkd.group;
+                          PrivateTmp = true;
+                          LockPersonality = true;
+                          MemoryDenyWriteExecute = true;
+                          ProtectSystem = "strict";
+                          ProtectHome = true;
+                          ProtectClock = true;
+                          ProtectControlGroups = true;
+                          ProtectKernelLogs = true;
+                          ProtectKernelModules = true;
+                          ProtectKernelTunables = true;
+                          RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ] ++ lib.optional (!cfg.netlinkd.enable) "AF_NETLINK";
+                          RestrictNamespaces = true;
+                          RestrictRealtime = true;
+                          SystemCallArchitectures = "native";
+                          SystemCallFilter = [ "~@mount" "~@swap" "~@reboot" "~@obsolete" "~@cpu-emulation" "~@debug" "~@module" "~keyctl" "~bpf" ];
+                        };
+                      };
+                    }
+                    // lib.optionalAttrs cfg.netlinkd.enable {
+                      "gremlind-${name}-netlinkd" = {
+                        description = "gremlind privileged netlink broker (${name})";
+                        wantedBy = [ "multi-user.target" ];
+                        after = [ "network-online.target" ];
+                        wants = [ "network-online.target" ];
+                        serviceConfig = {
+                          ExecStart = "${lib.getExe cfg.package} netlinkd -s ${cfg.netlinkd.socket} -mode 0660 -group ${cfg.netlinkd.group}"
+                            + lib.optionalString (cfg.netlinkd.greLocal != null) " -gre-local ${cfg.netlinkd.greLocal}";
+                          Restart = "on-failure";
+                          RestartSec = 3;
+                          UMask = "0077";
+                          AmbientCapabilities = [ "CAP_NET_ADMIN" ];
+                          CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
+                          NoNewPrivileges = true;
+                          DynamicUser = true;
+                          SupplementaryGroups = [ cfg.netlinkd.group ];
+                          PrivateTmp = true;
+                          LockPersonality = true;
+                          MemoryDenyWriteExecute = true;
+                          ProtectSystem = "strict";
+                          ProtectHome = true;
+                          ProtectClock = true;
+                          ProtectControlGroups = true;
+                          ProtectKernelLogs = true;
+                          ProtectKernelModules = true;
+                          ProtectKernelTunables = true;
+                          RestrictAddressFamilies = [ "AF_NETLINK" "AF_UNIX" ];
+                          RestrictNamespaces = true;
+                          RestrictRealtime = true;
+                          SystemCallArchitectures = "native";
+                          SystemCallFilter = [ "~@mount" "~@swap" "~@reboot" "~@obsolete" "~@cpu-emulation" "~@debug" "~@module" "~keyctl" "~bpf" ];
+                        };
+                      };
+                    }
+                  )
+                ) config.services.gremlind
+              );
+            };
         };
     };
 }
