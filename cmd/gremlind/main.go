@@ -116,13 +116,20 @@ func runServer(args []string) error {
 	if err != nil {
 		return err
 	}
+	// FOU already demultiplexes/identifies the tunnel by outer UDP port +
+	// address, so the GRE key field is redundant weight on every packet —
+	// force it off regardless of the configured gre_key, saving 4 bytes.
+	useGREKey := cfg.GREKeyEnabled()
+	if cfg.FOUPort != 0 {
+		useGREKey = false
+	}
 	sessCfg := session.Config{
 		Log:         log,
 		Pool:        pool,
 		ServerInner: serverInner,
 		GRELocal:    greLocal,
 		MTUCap:      cfg.MTU,
-		UseGREKey:   cfg.GREKeyEnabled(),
+		UseGREKey:   useGREKey,
 		UseGRESeq:   cfg.GRESeqEnabled(),
 		UpHook:      cfg.Hooks.Up,
 		DownHook:    cfg.Hooks.Down,
@@ -133,7 +140,7 @@ func runServer(args []string) error {
 		if err := gre.EnsureFOUReceive(cfg.FOUPort); err != nil {
 			return fmt.Errorf("server: %w", err)
 		}
-		log.Info("gre-over-udp (fou) enabled", "port", cfg.FOUPort)
+		log.Info("gre-over-udp (fou) enabled, gre key forced off", "port", cfg.FOUPort)
 	}
 	var mgr *session.Manager
 	if cfg.NetlinkSocket != "" {
