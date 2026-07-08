@@ -80,7 +80,13 @@ type Config struct {
 
 // New builds a Manager using the real netlink data-plane.
 func New(cfg Config) *Manager {
-	return newWith(cfg, netlinkProvisioner{})
+	return NewWithProvisioner(cfg, netlinkProvisioner{})
+}
+
+// NewWithProvisioner builds a Manager using an alternate data-plane backend,
+// e.g. the split-privilege netlink RPC broker.
+func NewWithProvisioner(cfg Config, prov Provisioner) *Manager {
+	return newWith(cfg, prov)
 }
 
 func newWith(cfg Config, prov Provisioner) *Manager {

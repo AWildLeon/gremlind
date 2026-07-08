@@ -26,7 +26,13 @@ type Info struct {
 }
 
 func (i Info) env() []string {
-	e := os.Environ()
+	// Keep hook privileges and information flow tight: do not inherit the daemon's
+	// whole environment (it may contain GREMLIND_SECRET or other credentials).
+	// Preserve PATH only so simple scripts can still find standard tools.
+	e := []string{}
+	if path := os.Getenv("PATH"); path != "" {
+		e = append(e, "PATH="+path)
+	}
 	add := func(k, v string) { e = append(e, k+"="+v) }
 	add("GREMLIND_EVENT", i.Event)
 	add("GREMLIND_IFACE", i.Iface)

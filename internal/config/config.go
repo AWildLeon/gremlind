@@ -71,6 +71,9 @@ type Config struct {
 	AdminSocketMode string `yaml:"admin_socket_mode"`
 	// AdminSocketGroup optionally sets the socket group for shared read access.
 	AdminSocketGroup string `yaml:"admin_socket_group"`
+	// NetlinkSocket, when set, makes the server ask a local privileged netlinkd
+	// broker to provision GRE interfaces instead of opening rtnetlink itself.
+	NetlinkSocket string `yaml:"netlink_socket"`
 	// MaxPendingHandshakes bounds concurrent unauthenticated handshakes (server
 	// role); 0 uses a built-in default. It caps the resources an unauthenticated
 	// connection flood can pin.

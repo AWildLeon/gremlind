@@ -7,6 +7,7 @@ package gre
 import (
 	"fmt"
 	"net/netip"
+	"strings"
 )
 
 // Deterministic link-local addresses assigned per tunnel by role. Every GRE
@@ -115,6 +116,26 @@ func Remove(name string) error {
 		return fmt.Errorf("gre: delete %s: %w", name, err)
 	}
 	return nil
+}
+
+// RemovePrefix deletes every interface whose name starts with prefix. It is used
+// by netlinkd on startup to clean stale gremlind-owned links after crashes.
+func RemovePrefix(prefix string) ([]string, error) {
+	links, err := dumpLinks()
+	if err != nil {
+		return nil, err
+	}
+	var removed []string
+	for _, li := range links {
+		if !strings.HasPrefix(li.name, prefix) {
+			continue
+		}
+		if err := linkDel(li.index); err != nil {
+			return removed, fmt.Errorf("gre: delete %s: %w", li.name, err)
+		}
+		removed = append(removed, li.name)
+	}
+	return removed, nil
 }
 
 // OuterMTU returns the MTU of the interface that owns the local outer address,

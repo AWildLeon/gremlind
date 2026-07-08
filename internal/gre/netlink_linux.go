@@ -157,23 +157,46 @@ func parseAttrs(b []byte) []nlattr {
 
 // --- typed operations ---
 
-// linkIndex resolves an interface name to its index by dumping links.
-func linkIndex(name string) (int32, error) {
+type linkInfo struct {
+	index int32
+	name  string
+}
+
+func dumpLinks() ([]linkInfo, error) {
 	m := newNlmsg(unix.RTM_GETLINK, unix.NLM_F_REQUEST|unix.NLM_F_DUMP)
 	m.put(make([]byte, unix.SizeofIfInfomsg))
 	msgs, err := nlExec(m.finalize(), true)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
+	var out []linkInfo
 	for _, p := range msgs {
 		if len(p) < unix.SizeofIfInfomsg {
 			continue
 		}
-		idx := int32(native.Uint32(p[4:]))
+		li := linkInfo{index: int32(native.Uint32(p[4:]))}
 		for _, a := range parseAttrs(p[unix.SizeofIfInfomsg:]) {
-			if a.typ == unix.IFLA_IFNAME && trimNul(a.data) == name {
-				return idx, nil
+			if a.typ == unix.IFLA_IFNAME {
+				li.name = trimNul(a.data)
+				break
 			}
+		}
+		if li.name != "" {
+			out = append(out, li)
+		}
+	}
+	return out, nil
+}
+
+// linkIndex resolves an interface name to its index by dumping links.
+func linkIndex(name string) (int32, error) {
+	links, err := dumpLinks()
+	if err != nil {
+		return 0, err
+	}
+	for _, li := range links {
+		if li.name == name {
+			return li.index, nil
 		}
 	}
 	return 0, errNoDevice

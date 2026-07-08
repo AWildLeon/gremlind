@@ -48,6 +48,7 @@ keepalive_interval: 15s
 keepalive_timeout: 45s
 decoy_redirect: "/"
 gremlinmusthide: true
+netlink_socket: "/run/gremlind-netlink.sock"
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -61,6 +62,9 @@ gremlinmusthide: true
 	}
 	if !c.GremlinMustHide {
 		t.Fatal("gremlinmusthide = false, want true")
+	}
+	if c.NetlinkSocket != "/run/gremlind-netlink.sock" {
+		t.Fatalf("netlink_socket = %q, want /run/gremlind-netlink.sock", c.NetlinkSocket)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -22,8 +23,10 @@ import (
 	"gremlind/internal/config"
 	"gremlind/internal/control"
 	"gremlind/internal/gre"
+	"gremlind/internal/hardening"
 	"gremlind/internal/hooks"
 	"gremlind/internal/ippool"
+	"gremlind/internal/provisionrpc"
 	"gremlind/internal/session"
 )
 
@@ -45,6 +48,8 @@ func run(args []string) error {
 		return runServer(rest)
 	case "connect":
 		return runConnect(rest)
+	case "netlinkd":
+		return runNetlinkd(rest)
 	case "status":
 		return runStatus(rest)
 	case "-h", "--help", "help":
@@ -60,9 +65,10 @@ func usage() {
 	fmt.Fprint(os.Stderr, `gremlind — control-plane daemon for GRE tunnels
 
 usage:
-  gremlind server  [-c config.yaml] [-v]
-  gremlind connect <server:port> [-c config.yaml] [-id ID] [-secret S] [-secret-env ENV] [-v]
-  gremlind status  [-s /run/gremlind.sock]
+  gremlind server   [-c config.yaml] [-v]
+  gremlind connect  <server:port> [-c config.yaml] [-id ID] [-secret S] [-secret-env ENV] [-v]
+  gremlind netlinkd -s /run/gremlind-netlink.sock [-mode 0600] [-group GROUP] [-gre-local ADDR] [-v]
+  gremlind status   [-s /run/gremlind.sock]
 `)
 }
 
@@ -90,10 +96,12 @@ func runServer(args []string) error {
 	}
 
 	log := newLogger(*verbose)
+	hardening.Apply(log)
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
 	}
+	warnLooseConfigPerms(log, *cfgPath)
 	if err := cfg.ValidateServer(); err != nil {
 		return err
 	}
@@ -106,7 +114,7 @@ func runServer(args []string) error {
 	if err != nil {
 		return err
 	}
-	mgr := session.New(session.Config{
+	sessCfg := session.Config{
 		Log:         log,
 		Pool:        pool,
 		ServerInner: serverInner,
@@ -116,7 +124,21 @@ func runServer(args []string) error {
 		UpHook:      cfg.Hooks.Up,
 		DownHook:    cfg.Hooks.Down,
 		LeaseTTL:    cfg.LeaseTTL.Std(),
-	})
+	}
+	var mgr *session.Manager
+	if cfg.NetlinkSocket != "" {
+		broker := provisionrpc.Client{Path: cfg.NetlinkSocket}
+		if mtu, err := broker.OuterMTU(greLocal); err == nil {
+			sessCfg.OuterMTU = mtu
+		} else {
+			log.Warn("could not detect outer MTU via netlink broker, assuming 1500", "err", err)
+			sessCfg.OuterMTU = 1500
+		}
+		mgr = session.NewWithProvisioner(sessCfg, broker)
+		log.Info("using netlink broker", "socket", cfg.NetlinkSocket)
+	} else {
+		mgr = session.New(sessCfg)
+	}
 
 	srv := &control.Server{
 		Log:                  log,
@@ -159,6 +181,77 @@ func runServer(args []string) error {
 	return srv.Serve(ctx, ln)
 }
 
+type greProvisioner struct{}
+
+func (greProvisioner) Ensure(p gre.Params) error { return gre.Ensure(p) }
+func (greProvisioner) Remove(name string) error  { return gre.Remove(name) }
+
+func runNetlinkd(args []string) error {
+	fs := flag.NewFlagSet("netlinkd", flag.ContinueOnError)
+	sock := fs.String("s", "", "unix socket path for provisioning RPC")
+	modeFlag := fs.String("mode", "0600", "provisioning socket mode (octal, e.g. 0600 or 0660)")
+	group := fs.String("group", "", "optional provisioning socket group")
+	greLocalFlag := fs.String("gre-local", "", "optional allowed GRE local outer address")
+	verbose := fs.Bool("v", false, "verbose (debug) logging")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *sock == "" {
+		return fmt.Errorf("netlinkd: -s /run/gremlind-netlink.sock is required")
+	}
+	var greLocal netip.Addr
+	if *greLocalFlag != "" {
+		addr, err := netip.ParseAddr(*greLocalFlag)
+		if err != nil {
+			return fmt.Errorf("netlinkd: invalid -gre-local %q: %w", *greLocalFlag, err)
+		}
+		greLocal = addr
+	}
+	mode, err := parseFileMode(*modeFlag)
+	if err != nil {
+		return fmt.Errorf("netlinkd: %w", err)
+	}
+	log := newLogger(*verbose)
+	hardening.Apply(log)
+	if removed, err := gre.RemovePrefix("grem"); err != nil {
+		return fmt.Errorf("netlinkd: cleanup stale grem interfaces: %w", err)
+	} else if len(removed) > 0 {
+		log.Info("removed stale gremlind interfaces", "ifaces", removed)
+	}
+	ctx, stop := signalContext()
+	defer stop()
+	return (&provisionrpc.Server{
+		Log:      log,
+		Path:     *sock,
+		Mode:     mode,
+		Group:    *group,
+		GRELocal: greLocal,
+		Prov:     greProvisioner{},
+		OuterMTU: gre.OuterMTU,
+	}).Serve(ctx)
+}
+
+func warnLooseConfigPerms(log *slog.Logger, path string) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	if st.Mode().Perm()&0o077 != 0 {
+		log.Warn("config file is readable by group/others; secrets should be private", "path", path, "mode", fmt.Sprintf("%04o", st.Mode().Perm()))
+	}
+}
+
+func parseFileMode(s string) (os.FileMode, error) {
+	mode, err := strconv.ParseUint(s, 8, 32)
+	if err != nil || mode > 0o777 {
+		if err == nil {
+			err = fmt.Errorf("mode exceeds 0777")
+		}
+		return 0, fmt.Errorf("invalid socket mode %q: %w", s, err)
+	}
+	return os.FileMode(mode), nil
+}
+
 func runConnect(args []string) error {
 	fs := flag.NewFlagSet("connect", flag.ContinueOnError)
 	cfgPath := fs.String("c", "", "path to config file")
@@ -185,6 +278,7 @@ func runConnect(args []string) error {
 	}
 
 	log := newLogger(*verbose)
+	hardening.Apply(log)
 
 	cfg := &config.Config{}
 	if *cfgPath != "" {
@@ -192,6 +286,7 @@ func runConnect(args []string) error {
 		if cfg, err = config.Load(*cfgPath); err != nil {
 			return err
 		}
+		warnLooseConfigPerms(log, *cfgPath)
 	}
 	// Ensure keepalive durations are non-zero even without a config file; a zero
 	// interval would panic time.NewTicker in the keepalive loop.
@@ -265,7 +360,19 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 		return netip.Addr{}, false, fmt.Errorf("could not determine local outer address")
 	}
 	outerMTU := 1500
-	if m, err := gre.OuterMTU(clientOuter); err == nil {
+	var prov interface {
+		Ensure(gre.Params) error
+		Remove(string) error
+	} = greProvisioner{}
+	if cfg.NetlinkSocket != "" {
+		broker := provisionrpc.Client{Path: cfg.NetlinkSocket}
+		prov = broker
+		if m, err := broker.OuterMTU(clientOuter); err == nil {
+			outerMTU = m
+		} else {
+			log.Debug("outer MTU detection via netlink broker failed, assuming 1500", "err", err)
+		}
+	} else if m, err := gre.OuterMTU(clientOuter); err == nil {
 		outerMTU = m
 	} else {
 		log.Debug("outer MTU detection failed, assuming 1500", "err", err)
@@ -290,7 +397,7 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 		"gre_key", sess.GREKey, "mtu", sess.MTU)
 
 	const ifName = "grem0"
-	if err := gre.Ensure(gre.Params{
+	if err := prov.Ensure(gre.Params{
 		Name:       ifName,
 		Local:      clientOuter,
 		Remote:     sess.ServerOuter,
@@ -319,7 +426,7 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 	hooks.Run(ctx, log, cfg.Hooks.Up, upInfo)
 
 	defer func() {
-		if err := gre.Remove(ifName); err != nil {
+		if err := prov.Remove(ifName); err != nil {
 			log.Warn("interface cleanup failed", "iface", ifName, "err", err)
 		} else {
 			log.Info("tunnel interface removed", "iface", ifName)

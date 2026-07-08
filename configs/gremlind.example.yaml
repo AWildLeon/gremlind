@@ -24,6 +24,11 @@ admin_socket: "/run/gremlind.sock"
 admin_socket_mode: "0600"
 admin_socket_group: ""
 
+# Optional split-privilege mode: run `gremlind netlinkd -s /run/gremlind-netlink.sock`
+# with CAP_NET_ADMIN and point the Internet-facing server at this socket. Then
+# the server does not need direct rtnetlink/kernel provisioning privileges.
+netlink_socket: ""
+
 # DoS hardening: bound how many connections may be mid-handshake (accepted but
 # not yet authenticated) at once — globally and per source IP. Beyond the limit
 # new connections are shed immediately. 0 = built-in defaults (256 / 16).
