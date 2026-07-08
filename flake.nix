@@ -218,7 +218,14 @@
                     set -eu
                     umask 077
                     out=${configPath}
-                    cat ${settingsFile} > "$out"
+                    ${
+                      # pkgs.formats.yaml renders {} for empty settings, and
+                      # yaml.v3 silently drops everything appended after a
+                      # "{}" document root (no error — cfg.Client.ID etc.
+                      # just end up empty). Skip the cat entirely when there
+                      # are no settings instead of writing that "{}" line.
+                      if cfg.settings == { } then ": > \"$out\"" else "cat ${settingsFile} > \"$out\""
+                    }
                     ${lib.optionalString (cfg.auth.pskFile != null || cfg.auth.clients != { }) ''
                       echo 'auth:' >> "$out"
                     ''}
