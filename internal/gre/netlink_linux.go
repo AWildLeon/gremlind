@@ -24,15 +24,22 @@ var errNoDevice = errors.New("gre: no such device")
 
 // IFLA_GRE_* attribute types (from linux/if_tunnel.h) — not exported by x/sys/unix.
 const (
-	iflaGreIFlags = 2
-	iflaGreOFlags = 3
-	iflaGreIKey   = 4
-	iflaGreOKey   = 5
-	iflaGreLocal  = 6
-	iflaGreRemote = 7
+	iflaGreIFlags     = 2
+	iflaGreOFlags     = 3
+	iflaGreIKey       = 4
+	iflaGreOKey       = 5
+	iflaGreLocal      = 6
+	iflaGreRemote     = 7
+	iflaGreEncapType  = 14
+	iflaGreEncapFlags = 15
+	iflaGreEncapSport = 16
+	iflaGreEncapDport = 17
 
 	greSeqFlag = 0x1000 // GRE_SEQ flag in the GRE header flags field
 	greKeyFlag = 0x2000 // GRE_KEY flag in the GRE header flags field
+
+	// TUNNEL_ENCAP_FOU from linux/if_tunnel.h — Foo-over-UDP encapsulation.
+	tunnelEncapFOU = 1
 )
 
 func align4(n int) int { return (n + 3) &^ 3 }
@@ -86,7 +93,14 @@ func (m *nlmsg) finalize() []byte {
 // terminating NLMSG_ERROR ack (error code 0 = success). For dump=true it
 // collects every response payload until NLMSG_DONE.
 func nlExec(req []byte, dump bool) ([][]byte, error) {
-	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
+	return nlExecProto(unix.NETLINK_ROUTE, req, dump)
+}
+
+// nlExecProto is nlExec generalized over the netlink protocol/family, so the
+// same minimal request/response plumbing serves both rtnetlink (this file)
+// and genetlink (fou_linux.go).
+func nlExecProto(proto int, req []byte, dump bool) ([][]byte, error) {
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, proto)
 	if err != nil {
 		return nil, fmt.Errorf("gre: netlink socket: %w", err)
 	}
@@ -348,6 +362,12 @@ func createGRE(p Params) error {
 	}
 	m.attr(iflaGreLocal, p.Local.AsSlice())
 	m.attr(iflaGreRemote, p.Remote.AsSlice())
+	if p.FOUDport != 0 {
+		m.attr(iflaGreEncapType, beU16(tunnelEncapFOU))
+		m.attr(iflaGreEncapFlags, beU16(0))
+		m.attr(iflaGreEncapSport, beU16(p.FOUSport))
+		m.attr(iflaGreEncapDport, beU16(p.FOUDport))
+	}
 	m.endNested(data)
 	m.endNested(li)
 

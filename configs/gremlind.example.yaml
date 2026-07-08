@@ -30,7 +30,15 @@ admin_socket_group: ""
 # Optional split-privilege mode: run `gremlind netlinkd -s /run/gremlind-netlink.sock`
 # with CAP_NET_ADMIN and point the Internet-facing server at this socket. Then
 # the server does not need direct rtnetlink/kernel provisioning privileges.
+# Not currently supported together with fou_port below.
 netlink_socket: ""
+
+# Wrap the GRE tunnel in Foo-over-UDP on this port when set (0 = disabled,
+# plain GRE). Outer traffic then looks like ordinary UDP, which passes
+# through NAT/firewalls/ISPs that block raw GRE (IP protocol 47) outright —
+# common on consumer DSL/PPPoE CPE gear. Both peers must set the *same* port;
+# there's no separate negotiation.
+fou_port: 0
 
 # DoS hardening: bound how many connections may be mid-handshake (accepted but
 # not yet authenticated) at once — globally and per source IP. Beyond the limit

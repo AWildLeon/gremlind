@@ -28,8 +28,9 @@ connection cleanly ends the session.
   MTU minus the GRE overhead, not a static config value.
 - Optional GRE keys for demultiplexing (like port numbers), with plain unkeyed
   GRE supported when desired.
-- **Native GRE** whenever there is no NAT in the path. (GRE-in-UDP / FOU as a NAT
-  fallback is future work.)
+- **Native GRE** whenever there is no NAT/filtering in the path, with an
+  optional **GRE-in-UDP (FOU)** fallback (`fou_port`) for links where raw GRE
+  (IP protocol 47) is blocked or mishandled — common on consumer ISP/CPE gear.
 - **Deterministic link-locals**: every tunnel gets fixed `fe80::1` (server) /
   `fe80::2` (client), so routing protocols over the tunnel have a stable next-hop.
 - **Minimal dependencies**: the data-plane talks to the kernel over a small,
@@ -126,8 +127,7 @@ recovers with the same inner IP), and server-side teardown on disconnect.
 
 Working: dynamic sessions, IPv6-native data-plane, MTU negotiation, PSK auth,
 keepalive/dead-peer detection, seamless roaming (reconnect + sticky inner
-leases), hooks, `status`, NixOS module.
+leases), hooks, `status`, GRE-in-UDP (FOU) fallback, NixOS module.
 
-Future work: GRE-in-UDP/FOU for NAT traversal; TLS-wrapped control channel;
-multiple sessions per control connection (GRE-key multiplexing); lease TTLs and
-server-outer auto-detection.
+Future work: TLS-wrapped control channel; multiple sessions per control
+connection (GRE-key multiplexing); lease TTLs and server-outer auto-detection.

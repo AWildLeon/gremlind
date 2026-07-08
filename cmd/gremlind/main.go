@@ -127,6 +127,13 @@ func runServer(args []string) error {
 		UpHook:      cfg.Hooks.Up,
 		DownHook:    cfg.Hooks.Down,
 		LeaseTTL:    cfg.LeaseTTL.Std(),
+		FOUPort:     cfg.FOUPort,
+	}
+	if cfg.FOUPort != 0 {
+		if err := gre.EnsureFOUReceive(cfg.FOUPort); err != nil {
+			return fmt.Errorf("server: %w", err)
+		}
+		log.Info("gre-over-udp (fou) enabled", "port", cfg.FOUPort)
 	}
 	var mgr *session.Manager
 	if cfg.NetlinkSocket != "" {
@@ -304,6 +311,12 @@ func runConnect(args []string) error {
 	if len(iface) > unix.IFNAMSIZ-1 {
 		return fmt.Errorf("connect: interface name %q longer than %d chars", iface, unix.IFNAMSIZ-1)
 	}
+	if cfg.FOUPort != 0 {
+		if err := gre.EnsureFOUReceive(cfg.FOUPort); err != nil {
+			return fmt.Errorf("connect: %w", err)
+		}
+		log.Info("gre-over-udp (fou) enabled", "port", cfg.FOUPort)
+	}
 
 	ctx, stop := signalContext()
 	defer stop()
@@ -414,6 +427,8 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 		InnerLocal: sess.ClientInner,
 		InnerPeer:  sess.ServerInner,
 		LinkLocal:  gre.ClientLinkLocal,
+		FOUSport:   cfg.FOUPort,
+		FOUDport:   cfg.FOUPort,
 	}); err != nil {
 		return sess.ClientInner, true, fmt.Errorf("build local GRE interface: %w", err)
 	}

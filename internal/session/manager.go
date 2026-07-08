@@ -57,6 +57,7 @@ type Manager struct {
 	upHook      string
 	downHook    string
 	leaseTTL    time.Duration
+	fouPort     uint16
 
 	mu         sync.Mutex
 	sessions   map[uint32]*Entry     // active sessions keyed by GRE key
@@ -78,6 +79,7 @@ type Config struct {
 	UpHook      string        // script run when a session interface comes up
 	DownHook    string        // script run when a session interface goes down
 	LeaseTTL    time.Duration // sticky lease lifetime after last use; 0 disables expiry
+	FOUPort     uint16        // wrap tunnels in Foo-over-UDP on this port; 0 = plain GRE
 }
 
 // New builds a Manager using the real netlink data-plane.
@@ -114,6 +116,7 @@ func newWith(cfg Config, prov Provisioner) *Manager {
 		upHook:      cfg.UpHook,
 		downHook:    cfg.DownHook,
 		leaseTTL:    cfg.LeaseTTL,
+		fouPort:     cfg.FOUPort,
 		sessions:    make(map[uint32]*Entry),
 		active:      make(map[string]uint32),
 		leases:      make(map[string]netip.Addr),
@@ -194,6 +197,8 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 		InnerLocal: m.serverInner,
 		InnerPeer:  clientInner,
 		LinkLocal:  gre.ServerLinkLocal,
+		FOUSport:   m.fouPort,
+		FOUDport:   m.fouPort,
 	}); err != nil {
 		m.mu.Lock()
 		if m.sessions[sessionKey] == entry {
@@ -299,7 +304,7 @@ func (m *Manager) negotiateMTU(clientOuterMTU int) int {
 	if clientOuterMTU > 0 && clientOuterMTU < outer {
 		outer = clientOuterMTU
 	}
-	mtu := outer - gre.OverheadWithOptions(m.greLocal, m.useGREKey, m.useGRESeq)
+	mtu := outer - gre.OverheadWithFOU(m.greLocal, m.useGREKey, m.useGRESeq, m.fouPort != 0)
 	if m.mtuCap > 0 && m.mtuCap < mtu {
 		mtu = m.mtuCap
 	}

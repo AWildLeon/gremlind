@@ -77,6 +77,16 @@ type Config struct {
 	// NetlinkSocket, when set, makes the server ask a local privileged netlinkd
 	// broker to provision GRE interfaces instead of opening rtnetlink itself.
 	NetlinkSocket string `yaml:"netlink_socket"`
+	// FOUPort wraps the GRE tunnel in Foo-over-UDP on this port when set (0
+	// disables it, plain GRE as before). Outer traffic then looks like
+	// ordinary UDP, which passes through NAT/firewalls/ISPs that block raw
+	// GRE (IP protocol 47) outright. Both peers must set the *same* port —
+	// each listens on it (EnsureFOUReceive) and targets the peer's copy of
+	// it as the encap destination port, so there's no separate negotiation.
+	// Not currently supported together with NetlinkSocket (split-privilege
+	// mode): registering the FOU receive port needs CAP_NET_ADMIN, which
+	// only the netlinkd broker holds in that mode.
+	FOUPort uint16 `yaml:"fou_port"`
 	// MaxPendingHandshakes bounds concurrent unauthenticated handshakes (server
 	// role); 0 uses a built-in default. It caps the resources an unauthenticated
 	// connection flood can pin.
@@ -179,6 +189,9 @@ func (c *Config) GRESeqEnabled() bool { return c.GRESeq != nil && *c.GRESeq }
 func (c *Config) validate() error {
 	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 		return fmt.Errorf("invalid listen %q: %w", c.Listen, err)
+	}
+	if c.FOUPort != 0 && c.NetlinkSocket != "" {
+		return fmt.Errorf("fou_port is not supported together with netlink_socket (split-privilege mode)")
 	}
 	if c.MTU < 0 {
 		return fmt.Errorf("mtu must be >= 0, got %d", c.MTU)
