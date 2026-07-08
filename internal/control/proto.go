@@ -9,8 +9,16 @@ import (
 	"gremlind/internal/auth"
 )
 
-// ProtoVersion is the control-protocol version carried in every frame header.
-const ProtoVersion uint8 = 1
+// Protocol versions carried in every frame header. Version 2 adds negotiated
+// TunnelFlags to SessionReply (GRE key/sequence selection), so it intentionally
+// does not interoperate with v1 peers.
+const (
+	ProtoVersionV1 uint8 = 1
+	ProtoVersionV2 uint8 = 2
+	ProtoVersion         = ProtoVersionV2
+)
+
+func supportedProtocolVersion(v uint8) bool { return v == ProtoVersion }
 
 // MsgType identifies a control message.
 type MsgType uint8

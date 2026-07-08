@@ -86,8 +86,14 @@ func TestWriteMessageHandlesShortWrites(t *testing.T) {
 	}
 }
 
+func TestProtocolVersionIsV2(t *testing.T) {
+	if ProtoVersion != ProtoVersionV2 {
+		t.Fatalf("ProtoVersion = %d, want v2", ProtoVersion)
+	}
+}
+
 func TestReadRejectsUnknownType(t *testing.T) {
-	// payloadLen=0, version=1, type=99
+	// payloadLen=0, current version, type=99
 	frame := []byte{0x00, 0x00, ProtoVersion, 99}
 	_, err := ReadMessage(bufio.NewReader(bytes.NewReader(frame)))
 	if err == nil {

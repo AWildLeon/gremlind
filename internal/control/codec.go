@@ -65,8 +65,8 @@ func ReadMessageLimited(r *bufio.Reader, maxPayload int) (Message, error) {
 	payloadLen := int(binary.BigEndian.Uint16(hdr[0:2]))
 	version := hdr[2]
 	msgType := MsgType(hdr[3])
-	if version != ProtoVersion {
-		return nil, fmt.Errorf("control: unsupported protocol version %d", version)
+	if !supportedProtocolVersion(version) {
+		return nil, fmt.Errorf("control: unsupported protocol version %d (want %d)", version, ProtoVersion)
 	}
 	if payloadLen > maxPayload {
 		return nil, fmt.Errorf("control: payload %d exceeds limit %d", payloadLen, maxPayload)
