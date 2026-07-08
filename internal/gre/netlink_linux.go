@@ -47,6 +47,16 @@ func align4(n int) int { return (n + 3) &^ 3 }
 func beU16(v uint16) []byte { return []byte{byte(v >> 8), byte(v)} }
 func beU32(v uint32) []byte { return []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)} }
 
+// nativeU16 encodes v in host byte order — unlike beU16, used for netlink
+// fields the kernel reads with nla_get_u16 (a plain local value, not a
+// wire-format field). IFLA_GRE_ENCAP_TYPE/ENCAP_FLAGS are nla_get_u16;
+// ENCAP_SPORT/ENCAP_DPORT are nla_get_be16 (real port numbers) and use beU16.
+func nativeU16(v uint16) []byte {
+	b := make([]byte, 2)
+	native.PutUint16(b, v)
+	return b
+}
+
 // nlmsg builds a single rtnetlink message: a NlMsghdr followed by a fixed
 // service header and a sequence of (possibly nested) attributes.
 type nlmsg struct{ b []byte }
@@ -363,8 +373,8 @@ func createGRE(p Params) error {
 	m.attr(iflaGreLocal, p.Local.AsSlice())
 	m.attr(iflaGreRemote, p.Remote.AsSlice())
 	if p.FOUDport != 0 {
-		m.attr(iflaGreEncapType, beU16(tunnelEncapFOU))
-		m.attr(iflaGreEncapFlags, beU16(0))
+		m.attr(iflaGreEncapType, nativeU16(tunnelEncapFOU))
+		m.attr(iflaGreEncapFlags, nativeU16(0))
 		m.attr(iflaGreEncapSport, beU16(p.FOUSport))
 		m.attr(iflaGreEncapDport, beU16(p.FOUDport))
 	}
