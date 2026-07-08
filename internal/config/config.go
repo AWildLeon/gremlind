@@ -111,10 +111,17 @@ type Client struct {
 	ID string `yaml:"id"`
 	// Secret is the shared secret; falls back to auth.psk when empty.
 	Secret string `yaml:"secret"`
+	// Iface names the local GRE tunnel interface. Defaults to "grem0"; set
+	// this explicitly when a host runs more than one connect instance at
+	// once (each needs its own interface name — see -iface / DefaultIface).
+	Iface string `yaml:"iface"`
 }
 
 // DefaultListen is used when Listen is empty. It is v6-native/dual-stack.
 const DefaultListen = "[::]:4747"
+
+// DefaultIface is used when Client.Iface is empty.
+const DefaultIface = "grem0"
 
 const MinSecretLen = 32
 
@@ -154,6 +161,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.AdminSocketMode == "" {
 		c.AdminSocketMode = "0600"
+	}
+	if c.Client.Iface == "" {
+		c.Client.Iface = DefaultIface
 	}
 }
 

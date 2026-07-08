@@ -129,6 +129,16 @@
                   default = null;
                   description = "File holding this client's secret (connect role). Loaded via systemd LoadCredential.";
                 };
+                iface = lib.mkOption {
+                  type = lib.types.nullOr lib.types.str;
+                  default = null;
+                  description = ''
+                    GRE tunnel interface name (connect role). Defaults to
+                    "grem0" if unset — set this explicitly whenever a host
+                    runs more than one connect instance at once, since two
+                    instances defaulting to the same name would collide.
+                  '';
+                };
               };
               useNetlinkd = lib.mkOption {
                 type = lib.types.bool;
@@ -238,7 +248,7 @@
                         printf '    ${id}: "%s"\n' "$(cat "$CREDENTIALS_DIRECTORY/client-${id}")" >> "$out"
                       '') (lib.attrNames cfg.auth.clients)}
                     ''}
-                    ${lib.optionalString (cfg.client.id != null || cfg.client.secretFile != null) ''
+                    ${lib.optionalString (cfg.client.id != null || cfg.client.secretFile != null || cfg.client.iface != null) ''
                       echo 'client:' >> "$out"
                     ''}
                     ${lib.optionalString (cfg.client.id != null) ''
@@ -246,6 +256,9 @@
                     ''}
                     ${lib.optionalString (cfg.client.secretFile != null) ''
                       printf '  secret: "%s"\n' "$(cat "$CREDENTIALS_DIRECTORY/secret")" >> "$out"
+                    ''}
+                    ${lib.optionalString (cfg.client.iface != null) ''
+                      printf '  iface: "%s"\n' ${lib.escapeShellArg cfg.client.iface} >> "$out"
                     ''}
                   '';
                 in

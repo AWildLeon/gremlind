@@ -28,6 +28,8 @@ import (
 	"gremlind/internal/ippool"
 	"gremlind/internal/provisionrpc"
 	"gremlind/internal/session"
+
+	"golang.org/x/sys/unix"
 )
 
 func main() {
@@ -259,6 +261,7 @@ func runConnect(args []string) error {
 	idFlag := fs.String("id", "", "client id (overrides config)")
 	secretFlag := fs.String("secret", "", "shared secret (overrides env/config; prefer -secret-env or GREMLIND_SECRET)")
 	secretEnv := fs.String("secret-env", "GREMLIND_SECRET", "environment variable containing shared secret")
+	ifaceFlag := fs.String("iface", "", "GRE tunnel interface name (overrides config; default grem0)")
 	verbose := fs.Bool("v", false, "verbose (debug) logging")
 
 	// Accept the <server:port> positional argument in any position by pulling
@@ -297,10 +300,14 @@ func runConnect(args []string) error {
 	if clientID == "" || secret == "" {
 		return fmt.Errorf("connect: client id and secret are required (via -id and GREMLIND_SECRET/-secret-env, -secret, or config)")
 	}
+	iface := pick(*ifaceFlag, cfg.Client.Iface)
+	if len(iface) > unix.IFNAMSIZ-1 {
+		return fmt.Errorf("connect: interface name %q longer than %d chars", iface, unix.IFNAMSIZ-1)
+	}
 
 	ctx, stop := signalContext()
 	defer stop()
-	return runDialer(ctx, log, cfg, server, clientID, secret)
+	return runDialer(ctx, log, cfg, server, clientID, secret, iface)
 }
 
 // reconnect backoff bounds.
@@ -313,7 +320,7 @@ const (
 // it reconnects with exponential backoff and re-requests its previous inner
 // address so the server's sticky lease hands back the same IP (seamless roaming).
 // It stops on context cancellation or a permanent rejection (bad credentials).
-func runDialer(ctx context.Context, log *slog.Logger, cfg *config.Config, server, clientID, secret string) error {
+func runDialer(ctx context.Context, log *slog.Logger, cfg *config.Config, server, clientID, secret, iface string) error {
 	var lastInner netip.Addr
 	backoff := minBackoff
 
@@ -321,7 +328,7 @@ func runDialer(ctx context.Context, log *slog.Logger, cfg *config.Config, server
 		if ctx.Err() != nil {
 			return nil
 		}
-		inner, established, err := dialOnce(ctx, log, cfg, server, clientID, secret, lastInner)
+		inner, established, err := dialOnce(ctx, log, cfg, server, clientID, secret, iface, lastInner)
 		if inner.IsValid() {
 			lastInner = inner // remember for sticky reconnect
 		}
@@ -348,7 +355,7 @@ func runDialer(ctx context.Context, log *slog.Logger, cfg *config.Config, server
 // dialOnce runs a single connect→session→keepalive cycle. It returns the inner
 // address that was assigned (for sticky reconnect) and whether a session was
 // actually established.
-func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server, clientID, secret string, requestedInner netip.Addr) (netip.Addr, bool, error) {
+func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server, clientID, secret, ifName string, requestedInner netip.Addr) (netip.Addr, bool, error) {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", server)
 	if err != nil {
@@ -397,7 +404,6 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 		"inner", sess.ClientInner, "server_inner", sess.ServerInner,
 		"gre_key", sess.GREKey, "mtu", sess.MTU)
 
-	const ifName = "grem0"
 	if err := prov.Ensure(gre.Params{
 		Name:       ifName,
 		Local:      clientOuter,
