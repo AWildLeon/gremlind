@@ -279,10 +279,13 @@
                         wantedBy = [ "multi-user.target" ];
                         after = [ "network-online.target" ];
                         wants = [ "network-online.target" ];
+                        # Keep retrying forever instead of giving up (systemd's
+                        # default start-limit) after a handful of failures.
+                        startLimitIntervalSec = 0;
                         serviceConfig = {
                           ExecStart = "${lib.getExe ncfg.package} netlinkd -s ${ncfg.socket} -mode 0660 -group ${ncfg.group}"
                             + lib.optionalString (ncfg.greLocal != null) " -gre-local ${ncfg.greLocal}";
-                          Restart = "on-failure";
+                          Restart = "always";
                           RestartSec = 3;
                           UMask = "0077";
                           AmbientCapabilities = [ "CAP_NET_ADMIN" ];
@@ -321,6 +324,11 @@
                         wantedBy = [ "multi-user.target" ];
                         after = [ "network-online.target" ] ++ lib.optional cfg.useNetlinkd "gremlind-netlinkd.service";
                         wants = [ "network-online.target" ] ++ lib.optional cfg.useNetlinkd "gremlind-netlinkd.service";
+                        # A connect instance that can't reach its server exits
+                        # rather than retrying internally, so keep systemd
+                        # retrying forever instead of giving up (the default
+                        # start-limit) after a handful of failed connects.
+                        startLimitIntervalSec = 0;
                         serviceConfig = {
                           RuntimeDirectory = runtimeDir;
                           LoadCredential = loadCredentials;
@@ -330,7 +338,7 @@
                               "${lib.getExe cfg.package} server -c ${configPath}"
                             else
                               "${lib.getExe cfg.package} connect ${cfg.connectTo} -c ${configPath}";
-                          Restart = "on-failure";
+                          Restart = "always";
                           RestartSec = 3;
                           UMask = "0077";
                           AmbientCapabilities = lib.optional (!cfg.useNetlinkd) "CAP_NET_ADMIN";
