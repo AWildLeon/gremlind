@@ -159,7 +159,7 @@ func (c *Client) KeepaliveLoop(ctx context.Context, conn net.Conn) error {
 		// Announce shutdown to the server only on a genuine parent cancellation;
 		// on a dropped connection the write would just fail harmlessly.
 		if ctx.Err() != nil {
-			_ = sec.WriteMessage(&Teardown{Reason: "client shutdown"})
+			_ = sec.WriteMessage(&Teardown{Reason: ReasonClientBye})
 		}
 		conn.Close()
 	}()

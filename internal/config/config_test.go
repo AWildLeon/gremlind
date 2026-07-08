@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -35,6 +37,30 @@ func TestGREKeyEnabledDefaultsToTrue(t *testing.T) {
 	c.GREKey = &v
 	if c.GREKeyEnabled() {
 		t.Fatal("GREKeyEnabled should honor explicit false")
+	}
+}
+
+func TestLoadDecoyOptions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gremlind.yaml")
+	if err := os.WriteFile(path, []byte(`
+listen: "[::1]:4747"
+keepalive_interval: 15s
+keepalive_timeout: 45s
+decoy_redirect: "/"
+gremlinmusthide: true
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DecoyRedirect != "/" {
+		t.Fatalf("decoy_redirect = %q, want /", c.DecoyRedirect)
+	}
+	if !c.GremlinMustHide {
+		t.Fatal("gremlinmusthide = false, want true")
 	}
 }
 

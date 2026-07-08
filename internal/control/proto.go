@@ -38,6 +38,18 @@ const (
 	ResultInternal    Result = 4
 )
 
+// Gremlin-flavored reason strings for the free-form Teardown.Reason and
+// SessionReply.Message fields. The control channel carries them in the clear
+// during the early handshake, so dressing the vocabulary up as gremlin nonsense
+// is cheap security-by-obscurity — and keeps the daemon on-brand. Match against
+// these constants, never the literal prose, so the jokes stay editable.
+const (
+	ReasonBadClientID = "🧌 who goes there? the gremlins don't know your face"
+	ReasonAuthFailed  = "🔒 wrong secret handshake — the gremlins hiss and slam the hatch"
+	ReasonInternal    = "🔥 a gremlin chewed clean through the wiring"
+	ReasonClientBye   = "👋 gremlin scuttling back into its box, ta-ra"
+)
+
 func (r Result) String() string {
 	switch r {
 	case ResultOK:

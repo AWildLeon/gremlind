@@ -31,6 +31,15 @@ admin_socket_group: ""
 max_pending_handshakes: 0
 max_pending_per_ip: 0
 
+# HTTP decoy: peers that don't speak the control protocol (scanners, browsers)
+# get a stock nginx page instead of a hint that gremlind lives here.
+# decoy_redirect: when set, reply with a permanent (301) redirect to this URL
+# instead of a 404. Use an absolute URL to avoid a redirect loop. Empty = 404.
+decoy_redirect: ""
+# gremlinmusthide: disable the /imagremlind teapot (418) easter egg so every
+# probe gets the plain decoy with no tells. Default false (egg enabled).
+gremlinmusthide: false
+
 keepalive_interval: 15s
 keepalive_timeout: 45s
 

@@ -80,6 +80,14 @@ type Config struct {
 	// global pending pool and locking out other clients.
 	MaxPendingPerIP int `yaml:"max_pending_per_ip"`
 
+	// DecoyRedirect, when set, makes the HTTP decoy answer non-control probes with
+	// a permanent (301) redirect to this location instead of the nginx 404. Use an
+	// absolute URL (e.g. "https://example.com/") to avoid a redirect loop.
+	DecoyRedirect string `yaml:"decoy_redirect"`
+	// GremlinMustHide disables the /imagremlind teapot easter egg so every probe
+	// gets the plain decoy (404 or the configured redirect) with no tells.
+	GremlinMustHide bool `yaml:"gremlinmusthide"`
+
 	KeepaliveInterval Duration `yaml:"keepalive_interval"`
 	KeepaliveTimeout  Duration `yaml:"keepalive_timeout"`
 	LeaseTTL          Duration `yaml:"lease_ttl"`

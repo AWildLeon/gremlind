@@ -88,7 +88,7 @@ func TestServerRejectsInvalidClientID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if td, ok := msg.(*Teardown); !ok || !strings.Contains(td.Reason, "invalid client id") {
+	if td, ok := msg.(*Teardown); !ok || td.Reason != ReasonBadClientID {
 		t.Fatalf("expected invalid-client-id teardown, got %#v", msg)
 	}
 	if est.gotParams.ClientID != "" {

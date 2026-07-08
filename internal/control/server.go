@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/netip"
 	"sync"
 	"time"
@@ -80,6 +81,14 @@ type Server struct {
 	// source IP, so one flooding source cannot fill the global pool and lock out
 	// legitimate clients; 0 uses defaultMaxPendingPerIP.
 	MaxPendingPerIP int
+
+	// DecoyRedirect, when non-empty, makes the HTTP decoy answer non-control
+	// probes with a 301 Moved Permanently to this location instead of the nginx
+	// 404. The /imagremlind easter egg still takes precedence unless GremlinMustHide.
+	DecoyRedirect string
+	// GremlinMustHide disables the /imagremlind teapot easter egg, so every probe
+	// gets the plain decoy (404 or the configured redirect) with no tells.
+	GremlinMustHide bool
 
 	sem     chan struct{}  // global pending-handshake semaphore, sized in Serve
 	perIPMu sync.Mutex     // guards perIP
@@ -207,6 +216,18 @@ func (s *Server) handle(ctx context.Context, conn net.Conn, release func()) {
 // ok=false (after best-effort notifying the peer) on any failure.
 func (s *Server) handshake(ctx context.Context, conn net.Conn, br *bufio.Reader, log *slog.Logger) (SessionParams, SessionGrant, *secureChannel, bool) {
 	conn.SetDeadline(time.Now().Add(handshakeTimeout))
+
+	// Camouflage: anything that doesn't open with a valid control frame is a
+	// stranger (port scanner, browser, curious human). Hand it a stock nginx 404
+	// and hang up, so the port looks like a boring idle web server rather than a
+	// gremlind daemon. Pure obscurity — it grants nothing; the PSK handshake below
+	// is the real gate.
+	if !looksLikeControl(br) {
+		log.Debug("non-control probe; serving decoy")
+		s.writeDecoy(conn, br, log)
+		return SessionParams{}, SessionGrant{}, nil, false
+	}
+
 	// Clear the handshake deadline before entering the keepalive phase; otherwise
 	// the write half stays pinned to now+handshakeTimeout and the first EchoAck
 	// sent after it expires fails with i/o timeout. keepaliveLoop manages its own
@@ -219,7 +240,7 @@ func (s *Server) handshake(ctx context.Context, conn net.Conn, br *bufio.Reader,
 	}
 	if !ValidClientID(hello.ClientID) {
 		log.Warn("invalid client id")
-		writeTeardown(conn, "invalid client id")
+		writeTeardown(conn, ReasonBadClientID)
 		return SessionParams{}, SessionGrant{}, nil, false
 	}
 	secret := auth.SecretFor(hello.ClientID, s.PSK, s.Clients)
@@ -245,7 +266,7 @@ func (s *Server) handshake(ctx context.Context, conn net.Conn, br *bufio.Reader,
 	}
 	if len(authMsg.MAC) != auth.NonceLen {
 		log.Warn("invalid client key-exchange nonce", "client", hello.ClientID)
-		writeTeardown(conn, "authentication failed")
+		writeTeardown(conn, ReasonAuthFailed)
 		return SessionParams{}, SessionGrant{}, nil, false
 	}
 	var clientNonce auth.Nonce
@@ -277,7 +298,7 @@ func (s *Server) handshake(ctx context.Context, conn net.Conn, br *bufio.Reader,
 
 	grant, result, err := s.Establisher.Establish(ctx, params)
 	if err != nil || result != ResultOK {
-		msg := "internal error"
+		msg := ReasonInternal
 		if err != nil {
 			msg = err.Error()
 		}
@@ -348,6 +369,88 @@ func expect[T Message](br *bufio.Reader, log *slog.Logger, what string) (T, bool
 
 func writeTeardown(w io.Writer, reason string) {
 	WriteMessage(w, &Teardown{Reason: reason})
+}
+
+// looksLikeControl reports whether the buffered stream begins with a plausible
+// gremlind control frame: the expected protocol version in the header and a
+// known message type. Peek leaves the bytes in place for the real handshake.
+// Anything else is treated as a stranger and served the decoy 404.
+func looksLikeControl(br *bufio.Reader) bool {
+	hdr, err := br.Peek(frameHeaderLen)
+	if err != nil {
+		return false
+	}
+	return hdr[2] == ProtoVersion && newMessage(MsgType(hdr[3])) != nil
+}
+
+// nginx404Body is the stock nginx 404 page, byte-for-byte, so the decoy is
+// indistinguishable from an unconfigured nginx default server.
+const nginx404Body = "<html>\r\n" +
+	"<head><title>404 Not Found</title></head>\r\n" +
+	"<body>\r\n" +
+	"<center><h1>404 Not Found</h1></center>\r\n" +
+	"<hr><center>nginx</center>\r\n" +
+	"</body>\r\n" +
+	"</html>\r\n"
+
+// teapotBody is the /imagremlind easter egg: whoever guesses the path gets a
+// gremlin pouring tea instead of the boring 404. It deliberately breaks the
+// nginx disguise — that's the joke, and only someone in on it finds this path.
+const teapotBody = "<html>\r\n" +
+	"<head><title>418 I'm a teapot</title></head>\r\n" +
+	"<body>\r\n" +
+	"<center><h1>418 I'm a teapot</h1></center>\r\n" +
+	"<center>🧌🫖 a gremlin brewed you some tea. no tunnels here, only oolong.</center>\r\n" +
+	"<hr><center>nginx</center>\r\n" +
+	"</body>\r\n" +
+	"</html>\r\n"
+
+// nginx301Body is the stock nginx 301 page, served with the redirect.
+const nginx301Body = "<html>\r\n" +
+	"<head><title>301 Moved Permanently</title></head>\r\n" +
+	"<body>\r\n" +
+	"<center><h1>301 Moved Permanently</h1></center>\r\n" +
+	"<hr><center>nginx</center>\r\n" +
+	"</body>\r\n" +
+	"</html>\r\n"
+
+// decoyEggPath is the secret path that trips the teapot easter egg.
+const decoyEggPath = "/imagremlind"
+
+// writeDecoy answers a non-control peer with an HTTP response and closes. It
+// parses the probe's request just enough to serve the /imagremlind easter egg
+// (418, unless GremlinMustHide), a configured 301 redirect (DecoyRedirect), or
+// otherwise a stock nginx 404. Camouflage only: it exposes nothing and gates
+// nothing.
+func (s *Server) writeDecoy(conn net.Conn, br *bufio.Reader, log *slog.Logger) {
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	path := ""
+	if req, err := http.ReadRequest(br); err == nil && req.URL != nil {
+		path = req.URL.Path
+	}
+
+	// The nginx 404/301 stay on a bare text/html to match a stock install; the
+	// teapot egg carries emoji, so it needs an explicit utf-8 charset to render.
+	status, body, contentType, location := "404 Not Found", nginx404Body, "text/html", ""
+	switch {
+	case !s.GremlinMustHide && path == decoyEggPath:
+		log.Debug("decoy easter egg tripped", "path", path)
+		status, body, contentType = "418 I'm a teapot", teapotBody, "text/html; charset=utf-8"
+	case s.DecoyRedirect != "":
+		status, body, location = "301 Moved Permanently", nginx301Body, s.DecoyRedirect
+	}
+
+	resp := "HTTP/1.1 " + status + "\r\n" +
+		"Server: nginx\r\n" +
+		"Date: " + time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT") + "\r\n" +
+		"Content-Type: " + contentType + "\r\n"
+	if location != "" {
+		resp += "Location: " + location + "\r\n"
+	}
+	resp += fmt.Sprintf("Content-Length: %d\r\n", len(body)) +
+		"Connection: close\r\n" +
+		"\r\n" + body
+	_, _ = io.WriteString(conn, resp)
 }
 
 // outerAddr extracts the IP of a control peer as a netip.Addr (unmapped).

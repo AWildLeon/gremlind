@@ -126,6 +126,8 @@ func runServer(args []string) error {
 		KeepaliveTimeout:     cfg.KeepaliveTimeout.Std(),
 		MaxPendingHandshakes: cfg.MaxPendingHandshakes,
 		MaxPendingPerIP:      cfg.MaxPendingPerIP,
+		DecoyRedirect:        cfg.DecoyRedirect,
+		GremlinMustHide:      cfg.GremlinMustHide,
 	}
 
 	ctx, stop := signalContext()
