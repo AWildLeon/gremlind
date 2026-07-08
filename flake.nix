@@ -130,23 +130,18 @@
                   description = "File holding this client's secret (connect role). Loaded via systemd LoadCredential.";
                 };
               };
-              netlinkd = {
-                enable = lib.mkEnableOption "separate privileged gremlind netlink broker for this instance";
-                socket = lib.mkOption {
-                  type = lib.types.str;
-                  default = "/run/gremlind-netlink-${name}.sock";
-                  description = "Unix socket for this instance's gremlind netlinkd; set netlink_socket to this path in settings.";
-                };
-                group = lib.mkOption {
-                  type = lib.types.str;
-                  default = "gremlind-netlink-${name}";
-                  description = "Group allowed to talk to the netlink broker socket.";
-                };
-                greLocal = lib.mkOption {
-                  type = lib.types.nullOr lib.types.str;
-                  default = null;
-                  description = "Optional GRE local address allow-list enforced by netlinkd.";
-                };
+              useNetlinkd = lib.mkOption {
+                type = lib.types.bool;
+                default = false;
+                description = ''
+                  Ask the shared services.gremlind-netlinkd broker to
+                  provision GRE interfaces instead of holding CAP_NET_ADMIN
+                  directly. Set services.gremlind-netlinkd.enable = true and
+                  point this instance's settings.netlink_socket at
+                  config.services.gremlind-netlinkd.socket too — netlinkd is
+                  a dumb rtnetlink proxy, so one broker is enough for every
+                  instance on a host, not one per instance.
+                '';
               };
             };
           };
@@ -170,6 +165,35 @@
                 client.id = "home-core";
                 client.secretFile = "/run/agenix/gremlind_home";
               };
+            };
+          };
+
+          options.services.gremlind-netlinkd = {
+            enable = lib.mkEnableOption ''
+              a single shared privileged gremlind netlink broker for every
+              services.gremlind instance on this host (split-privilege mode:
+              instances that opt in via useNetlinkd ask this broker to
+              provision GRE interfaces instead of holding CAP_NET_ADMIN
+              themselves)'';
+            package = lib.mkOption {
+              type = lib.types.package;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+              description = "gremlind package to run.";
+            };
+            socket = lib.mkOption {
+              type = lib.types.str;
+              default = "/run/gremlind-netlink.sock";
+              description = "Unix socket for gremlind netlinkd; set each instance's settings.netlink_socket to this path.";
+            };
+            group = lib.mkOption {
+              type = lib.types.str;
+              default = "gremlind-netlink";
+              description = "Group allowed to talk to the netlink broker socket; instances with useNetlinkd = true join it automatically.";
+            };
+            greLocal = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "Optional GRE local address allow-list enforced by netlinkd.";
             };
           };
 
@@ -239,14 +263,53 @@
                 ) config.services.gremlind
               );
 
-              users.groups = lib.mkMerge (
-                lib.mapAttrsToList (
-                  _: cfg: lib.mkIf (cfg.enable && cfg.netlinkd.enable) { ${cfg.netlinkd.group} = { }; }
-                ) config.services.gremlind
-              );
+              users.groups = lib.mkIf config.services.gremlind-netlinkd.enable {
+                ${config.services.gremlind-netlinkd.group} = { };
+              };
 
               systemd.services = lib.mkMerge (
-                lib.mapAttrsToList (
+                [
+                  (lib.mkIf config.services.gremlind-netlinkd.enable {
+                    gremlind-netlinkd =
+                      let
+                        ncfg = config.services.gremlind-netlinkd;
+                      in
+                      {
+                        description = "gremlind privileged netlink broker";
+                        wantedBy = [ "multi-user.target" ];
+                        after = [ "network-online.target" ];
+                        wants = [ "network-online.target" ];
+                        serviceConfig = {
+                          ExecStart = "${lib.getExe ncfg.package} netlinkd -s ${ncfg.socket} -mode 0660 -group ${ncfg.group}"
+                            + lib.optionalString (ncfg.greLocal != null) " -gre-local ${ncfg.greLocal}";
+                          Restart = "on-failure";
+                          RestartSec = 3;
+                          UMask = "0077";
+                          AmbientCapabilities = [ "CAP_NET_ADMIN" ];
+                          CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
+                          NoNewPrivileges = true;
+                          DynamicUser = true;
+                          SupplementaryGroups = [ ncfg.group ];
+                          PrivateTmp = true;
+                          LockPersonality = true;
+                          MemoryDenyWriteExecute = true;
+                          ProtectSystem = "strict";
+                          ProtectHome = true;
+                          ProtectClock = true;
+                          ProtectControlGroups = true;
+                          ProtectKernelLogs = true;
+                          ProtectKernelModules = true;
+                          ProtectKernelTunables = true;
+                          RestrictAddressFamilies = [ "AF_NETLINK" "AF_UNIX" ];
+                          RestrictNamespaces = true;
+                          RestrictRealtime = true;
+                          SystemCallArchitectures = "native";
+                          SystemCallFilter = [ "~@mount" "~@swap" "~@reboot" "~@obsolete" "~@cpu-emulation" "~@debug" "~@module" "~keyctl" "~bpf" ];
+                        };
+                      };
+                  })
+                ]
+                ++ lib.mapAttrsToList (
                   name: cfg:
                   lib.mkIf cfg.enable (
                     let
@@ -256,8 +319,8 @@
                       "gremlind-${name}" = {
                         description = "gremlind GRE control-plane daemon (${name})";
                         wantedBy = [ "multi-user.target" ];
-                        after = [ "network-online.target" ] ++ lib.optional cfg.netlinkd.enable "gremlind-${name}-netlinkd.service";
-                        wants = [ "network-online.target" ] ++ lib.optional cfg.netlinkd.enable "gremlind-${name}-netlinkd.service";
+                        after = [ "network-online.target" ] ++ lib.optional cfg.useNetlinkd "gremlind-netlinkd.service";
+                        wants = [ "network-online.target" ] ++ lib.optional cfg.useNetlinkd "gremlind-netlinkd.service";
                         serviceConfig = {
                           RuntimeDirectory = runtimeDir;
                           LoadCredential = loadCredentials;
@@ -270,11 +333,11 @@
                           Restart = "on-failure";
                           RestartSec = 3;
                           UMask = "0077";
-                          AmbientCapabilities = lib.optional (!cfg.netlinkd.enable) "CAP_NET_ADMIN";
-                          CapabilityBoundingSet = lib.optional (!cfg.netlinkd.enable) "CAP_NET_ADMIN";
+                          AmbientCapabilities = lib.optional (!cfg.useNetlinkd) "CAP_NET_ADMIN";
+                          CapabilityBoundingSet = lib.optional (!cfg.useNetlinkd) "CAP_NET_ADMIN";
                           NoNewPrivileges = true;
                           DynamicUser = true;
-                          SupplementaryGroups = lib.optional cfg.netlinkd.enable cfg.netlinkd.group;
+                          SupplementaryGroups = lib.optional cfg.useNetlinkd config.services.gremlind-netlinkd.group;
                           PrivateTmp = true;
                           LockPersonality = true;
                           MemoryDenyWriteExecute = true;
@@ -285,42 +348,7 @@
                           ProtectKernelLogs = true;
                           ProtectKernelModules = true;
                           ProtectKernelTunables = true;
-                          RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ] ++ lib.optional (!cfg.netlinkd.enable) "AF_NETLINK";
-                          RestrictNamespaces = true;
-                          RestrictRealtime = true;
-                          SystemCallArchitectures = "native";
-                          SystemCallFilter = [ "~@mount" "~@swap" "~@reboot" "~@obsolete" "~@cpu-emulation" "~@debug" "~@module" "~keyctl" "~bpf" ];
-                        };
-                      };
-                    }
-                    // lib.optionalAttrs cfg.netlinkd.enable {
-                      "gremlind-${name}-netlinkd" = {
-                        description = "gremlind privileged netlink broker (${name})";
-                        wantedBy = [ "multi-user.target" ];
-                        after = [ "network-online.target" ];
-                        wants = [ "network-online.target" ];
-                        serviceConfig = {
-                          ExecStart = "${lib.getExe cfg.package} netlinkd -s ${cfg.netlinkd.socket} -mode 0660 -group ${cfg.netlinkd.group}"
-                            + lib.optionalString (cfg.netlinkd.greLocal != null) " -gre-local ${cfg.netlinkd.greLocal}";
-                          Restart = "on-failure";
-                          RestartSec = 3;
-                          UMask = "0077";
-                          AmbientCapabilities = [ "CAP_NET_ADMIN" ];
-                          CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
-                          NoNewPrivileges = true;
-                          DynamicUser = true;
-                          SupplementaryGroups = [ cfg.netlinkd.group ];
-                          PrivateTmp = true;
-                          LockPersonality = true;
-                          MemoryDenyWriteExecute = true;
-                          ProtectSystem = "strict";
-                          ProtectHome = true;
-                          ProtectClock = true;
-                          ProtectControlGroups = true;
-                          ProtectKernelLogs = true;
-                          ProtectKernelModules = true;
-                          ProtectKernelTunables = true;
-                          RestrictAddressFamilies = [ "AF_NETLINK" "AF_UNIX" ];
+                          RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ] ++ lib.optional (!cfg.useNetlinkd) "AF_NETLINK";
                           RestrictNamespaces = true;
                           RestrictRealtime = true;
                           SystemCallArchitectures = "native";
