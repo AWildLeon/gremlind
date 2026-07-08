@@ -61,7 +61,7 @@ func usage() {
 
 usage:
   gremlind server  [-c config.yaml] [-v]
-  gremlind connect <server:port> [-c config.yaml] [-id ID] [-secret S] [-v]
+  gremlind connect <server:port> [-c config.yaml] [-id ID] [-secret S] [-secret-env ENV] [-v]
   gremlind status  [-s /run/gremlind.sock]
 `)
 }
@@ -161,7 +161,8 @@ func runConnect(args []string) error {
 	fs := flag.NewFlagSet("connect", flag.ContinueOnError)
 	cfgPath := fs.String("c", "", "path to config file")
 	idFlag := fs.String("id", "", "client id (overrides config)")
-	secretFlag := fs.String("secret", "", "shared secret (overrides config)")
+	secretFlag := fs.String("secret", "", "shared secret (overrides env/config; prefer -secret-env or GREMLIND_SECRET)")
+	secretEnv := fs.String("secret-env", "GREMLIND_SECRET", "environment variable containing shared secret")
 	verbose := fs.Bool("v", false, "verbose (debug) logging")
 
 	// Accept the <server:port> positional argument in any position by pulling
@@ -194,9 +195,9 @@ func runConnect(args []string) error {
 	// interval would panic time.NewTicker in the keepalive loop.
 	cfg.ApplyDefaults()
 	clientID := pick(*idFlag, cfg.Client.ID)
-	secret := pick(*secretFlag, cfg.Client.Secret, cfg.Auth.PSK)
+	secret := secretFromInputs(*secretFlag, *secretEnv, cfg)
 	if clientID == "" || secret == "" {
-		return fmt.Errorf("connect: client id and secret are required (via -id/-secret or config)")
+		return fmt.Errorf("connect: client id and secret are required (via -id and GREMLIND_SECRET/-secret-env, -secret, or config)")
 	}
 
 	ctx, stop := signalContext()
@@ -361,6 +362,21 @@ func pick(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// secretFromInputs resolves the client secret without requiring it to appear in
+// the process command line. Precedence is: explicit -secret flag, configured
+// environment variable, client.secret, then legacy auth.psk fallback.
+func secretFromInputs(secretFlag, secretEnv string, cfg *config.Config) string {
+	if secretFlag != "" {
+		return secretFlag
+	}
+	if secretEnv != "" {
+		if v := os.Getenv(secretEnv); v != "" {
+			return v
+		}
+	}
+	return pick(cfg.Client.Secret, cfg.Auth.PSK)
 }
 
 // localOuter extracts the local IP of an established connection.

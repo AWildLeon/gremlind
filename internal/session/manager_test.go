@@ -175,6 +175,41 @@ func TestStickyLeaseReusedAfterTeardown(t *testing.T) {
 	}
 }
 
+func TestStickyLeaseCannotBeClaimedByDifferentClient(t *testing.T) {
+	prov := &fakeProv{}
+	m, _ := newTestManager(t, 1500, 0, prov)
+	ctx := context.Background()
+
+	siteA := control.SessionParams{ClientID: "site-a", ClientOuter: netip.MustParseAddr("2001:db8::20"), OuterMTU: 1500}
+	grantA, _, err := m.Establish(ctx, siteA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Teardown(siteA, grantA)
+
+	siteB := control.SessionParams{
+		ClientID:       "site-b",
+		ClientOuter:    netip.MustParseAddr("2001:db8::30"),
+		OuterMTU:       1500,
+		RequestedInner: grantA.ClientInner,
+	}
+	grantB, res, err := m.Establish(ctx, siteB)
+	if err != nil || res != control.ResultOK {
+		t.Fatalf("establish site-b: res=%s err=%v", res, err)
+	}
+	if grantB.ClientInner == grantA.ClientInner {
+		t.Fatalf("site-b claimed site-a sticky lease %s", grantA.ClientInner)
+	}
+
+	grantA2, res, err := m.Establish(ctx, siteA)
+	if err != nil || res != control.ResultOK {
+		t.Fatalf("re-establish site-a: res=%s err=%v", res, err)
+	}
+	if grantA2.ClientInner != grantA.ClientInner {
+		t.Fatalf("site-a did not get its reserved lease back: got %s want %s", grantA2.ClientInner, grantA.ClientInner)
+	}
+}
+
 func TestRoamingEvictsStaleSessionAndKeepsInnerIP(t *testing.T) {
 	prov := &fakeProv{}
 	m, pool := newTestManager(t, 1500, 0, prov)

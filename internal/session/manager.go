@@ -300,17 +300,51 @@ func minimumTunnelMTU(outer netip.Addr) int {
 
 // allocInnerLocked assigns an inner address, preferring stability: an explicit
 // client request first, then the client's sticky lease (its previous address),
-// and finally a fresh address. Caller must hold m.mu. AllocateSpecific/Allocate
-// mutate only the pool's own state, which is independently locked.
+// and finally a fresh address. Sticky leases are treated as reservations while
+// they are unexpired: an authenticated client must not be able to request or be
+// freshly allocated another client's inactive lease. Caller must hold m.mu.
+// AllocateSpecific/Allocate mutate only the pool's own state, which is
+// independently locked.
 func (m *Manager) allocInnerLocked(clientID string, requested netip.Addr) (netip.Addr, error) {
 	for _, cand := range []netip.Addr{requested, m.leases[clientID]} {
-		if cand.IsValid() {
+		if cand.IsValid() && m.leaseAvailableToLocked(clientID, cand) {
 			if err := m.pool.AllocateSpecific(cand); err == nil {
 				return cand, nil
 			}
 		}
 	}
-	return m.pool.Allocate()
+
+	// Pool.Allocate returns the next free address without knowing about sticky
+	// leases. Skip addresses reserved for other clients, then put them back before
+	// returning so a failed allocation attempt does not consume the pool.
+	var skipped []netip.Addr
+	for {
+		addr, err := m.pool.Allocate()
+		if err != nil {
+			for _, skippedAddr := range skipped {
+				m.pool.Release(skippedAddr)
+			}
+			return netip.Addr{}, err
+		}
+		if m.leaseAvailableToLocked(clientID, addr) {
+			for _, skippedAddr := range skipped {
+				m.pool.Release(skippedAddr)
+			}
+			return addr, nil
+		}
+		skipped = append(skipped, addr)
+	}
+}
+
+// leaseAvailableToLocked reports whether addr is not reserved by another
+// client's sticky lease. Caller must hold m.mu.
+func (m *Manager) leaseAvailableToLocked(clientID string, addr netip.Addr) bool {
+	for owner, leased := range m.leases {
+		if owner != clientID && leased == addr {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Manager) ifName(key uint32) string {

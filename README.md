@@ -57,11 +57,16 @@ nix run . -- server -c configs/gremlind.example.yaml
 
 ```
 gremlind server  [-c config.yaml] [-v]
-gremlind connect <server:port> [-c config.yaml] [-id ID] [-secret S] [-v]
+gremlind connect <server:port> [-c config.yaml] [-id ID] [-secret S] [-secret-env ENV] [-v]
 gremlind status  [-s /run/gremlind.sock]
 ```
 
 Both roles require `CAP_NET_ADMIN` (they create GRE interfaces via netlink).
+
+For clients, prefer loading secrets from the environment instead of passing them
+on the command line, e.g. `GREMLIND_SECRET=... gremlind connect host:4747 -id site-a`.
+Use `-secret-env NAME` to read from a different variable. Precedence is
+`-secret`, environment, `client.secret`, then `auth.psk`.
 
 See [configs/gremlind.example.yaml](configs/gremlind.example.yaml) for a fully
 commented configuration.
