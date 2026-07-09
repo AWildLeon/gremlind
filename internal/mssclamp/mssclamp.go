@@ -180,7 +180,7 @@ func applyNFT(ctx context.Context, cfg config.MSSClamp, iface string, spec direc
 		} else {
 			args = append(args, proto.nftPMTU...)
 		}
-		args = append(args, "comment", marker(iface, spec.name, proto.name))
+		args = append(args, "comment", nftString(marker(iface, spec.name, proto.name)))
 		if err := run(ctx, "nft", args...); err != nil {
 			return err
 		}
@@ -340,6 +340,7 @@ func iptablesRule(cfg config.MSSClamp, iface string, spec directionSpec, proto p
 
 func marker(iface, direction, proto string) string { return markerPrefix(iface, direction) + proto }
 func markerPrefix(iface, direction string) string  { return "gremlind:" + iface + ":" + direction + ":" }
+func nftString(s string) string                    { return strconv.Quote(s) }
 
 func run(ctx context.Context, name string, args ...string) error {
 	_, err := output(ctx, name, args...)
