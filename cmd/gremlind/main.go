@@ -26,6 +26,7 @@ import (
 	"gremlind/internal/hardening"
 	"gremlind/internal/hooks"
 	"gremlind/internal/ippool"
+	"gremlind/internal/mssclamp"
 	"gremlind/internal/provisionrpc"
 	"gremlind/internal/session"
 
@@ -135,6 +136,7 @@ func runServer(args []string) error {
 		DownHook:    cfg.Hooks.Down,
 		LeaseTTL:    cfg.LeaseTTL.Std(),
 		FOUPort:     cfg.FOUPort,
+		MSSClamp:    cfg.MSSClamp,
 	}
 	if cfg.FOUPort != 0 {
 		if err := gre.EnsureFOUReceive(cfg.FOUPort); err != nil {
@@ -459,6 +461,10 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 	}); err != nil {
 		return sess.ClientInner, true, fmt.Errorf("build local GRE interface: %w", err)
 	}
+	if err := mssclamp.Apply(ctx, log, cfg.MSSClamp, ifName, int(sess.MTU)); err != nil {
+		_ = prov.Remove(ifName)
+		return sess.ClientInner, true, fmt.Errorf("install mss clamp rules: %w", err)
+	}
 	log.Info("tunnel interface up", "iface", ifName, "addr", sess.ClientInner)
 
 	hookInfo := hooks.Info{
@@ -476,6 +482,9 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 	hooks.Run(ctx, log, cfg.Hooks.Up, upInfo)
 
 	defer func() {
+		if err := mssclamp.Remove(context.Background(), log, cfg.MSSClamp, ifName, int(sess.MTU)); err != nil {
+			log.Warn("mss clamp cleanup failed", "iface", ifName, "err", err)
+		}
 		if err := prov.Remove(ifName); err != nil {
 			log.Warn("interface cleanup failed", "iface", ifName, "err", err)
 		} else {

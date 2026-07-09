@@ -63,6 +63,27 @@ keepalive_timeout: 45s
 # Set to 0s to keep old leases until daemon restart.
 lease_ttl: 24h
 
+# Optional MSS clamping for routed TCP traffic using gremlind tunnel interfaces.
+# mss_mode = pmtu uses PMTU clamp (`rt mtu`/`rt6 mtu` for nftables,
+# --clamp-mss-to-pmtu for iptables). mss_mode = tunnel_mtu derives fixed MSS
+# from gremlind's negotiated tunnel MTU (IPv4: MTU-40, IPv6: MTU-60). Set mss
+# for a fixed value for both protocols, or mss4/mss6 to set IPv4/IPv6 separately.
+# nft_manage_table creates a small dedicated inet/gremlind/forward chain when
+# using the defaults.
+mss_clamp:
+  enabled: false
+  backend: "nftables" # nftables | iptables
+  direction: "out"    # out | in | both
+  mss_mode: "pmtu" # pmtu | tunnel_mtu
+  mss: 0
+  mss4: 0
+  mss6: 0
+  nft_family: "inet"
+  nft_table: "gremlind"
+  nft_chain: "forward"
+  nft_manage_table: true
+  iptables_chain: "FORWARD"
+
 auth:
   # Use a high-entropy secret; the HMAC handshake is resistant to passive replay
   # but captured handshakes can still be used for offline guessing of weak PSKs.

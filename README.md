@@ -82,6 +82,14 @@ selected address is bound on the TCP control connection and becomes the GRE oute
 address advertised to the server. `client.source_fallback = "kernel"` can opt
 out of strict failure when no rule matches.
 
+### MSS clamping
+
+`mss_clamp` can let gremlind install/remove nftables or iptables TCPMSS rules
+for each tunnel interface. It supports outbound, inbound, or both directions,
+PMTU clamping by default, fixed MSS values via `mss` or per-protocol `mss4` /
+`mss6` overrides, or `mss_mode = "tunnel_mtu"` to derive fixed values from the
+negotiated tunnel MTU (`MTU-40` for IPv4 and `MTU-60` for IPv6).
+
 ### Up/down hooks
 
 When a tunnel comes up or down, the configured `hooks.up` / `hooks.down` script

@@ -62,6 +62,17 @@ decoy_redirect: "/"
 gremlinmusthide: true
 netlink_socket: "/run/gremlind-netlink.sock"
 gre_seq: true
+mss_clamp:
+  enabled: true
+  backend: "nftables"
+  direction: "both"
+  mss_mode: "tunnel_mtu"
+  mss: 1360
+  mss4: 1360
+  mss6: 1340
+  nft_family: "inet"
+  nft_table: "gremlind"
+  nft_chain: "forward"
 client:
   source_fallback: "kernel"
   source_rules:
@@ -90,6 +101,9 @@ client:
 	if !c.GRESeqEnabled() {
 		t.Fatal("gre_seq = false, want true")
 	}
+	if !c.MSSClamp.Enabled || c.MSSClamp.Backend != "nftables" || c.MSSClamp.Direction != "both" || c.MSSClamp.MSSMode != "tunnel_mtu" || c.MSSClamp.MSS != 1360 || c.MSSClamp.MSS4 != 1360 || c.MSSClamp.MSS6 != 1340 {
+		t.Fatalf("mss_clamp = %+v", c.MSSClamp)
+	}
 	if len(c.Client.SourceRules) != 1 {
 		t.Fatalf("source_rules len = %d, want 1", len(c.Client.SourceRules))
 	}
@@ -115,6 +129,25 @@ func TestInvalidSourceRuleExcludeSubnet(t *testing.T) {
 	c.ApplyDefaults()
 	if err := c.validate(); err == nil {
 		t.Fatal("validate succeeded with invalid source exclude subnet")
+	}
+}
+
+func TestInvalidMSSClamp(t *testing.T) {
+	for name, mss := range map[string]MSSClamp{
+		"backend":   {Enabled: true, Backend: "pf"},
+		"direction": {Enabled: true, Direction: "sideways"},
+		"mss_mode":  {Enabled: true, MSSMode: "guess"},
+		"mss":       {Enabled: true, MSS: -1},
+		"mss4":      {Enabled: true, MSS4: -1},
+		"mss6":      {Enabled: true, MSS6: 70000},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := &Config{Listen: "[::1]:4747", MSSClamp: mss}
+			c.ApplyDefaults()
+			if err := c.validate(); err == nil {
+				t.Fatal("validate succeeded, want error")
+			}
+		})
 	}
 }
 

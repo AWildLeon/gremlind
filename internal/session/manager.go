@@ -13,10 +13,12 @@ import (
 	"sync"
 	"time"
 
+	"gremlind/internal/config"
 	"gremlind/internal/control"
 	"gremlind/internal/gre"
 	"gremlind/internal/hooks"
 	"gremlind/internal/ippool"
+	"gremlind/internal/mssclamp"
 )
 
 // Provisioner abstracts the data-plane so the manager is unit-testable without
@@ -58,6 +60,7 @@ type Manager struct {
 	downHook    string
 	leaseTTL    time.Duration
 	fouPort     uint16
+	mssClamp    config.MSSClamp
 
 	mu         sync.Mutex
 	sessions   map[uint32]*Entry     // active sessions keyed by GRE key
@@ -80,6 +83,7 @@ type Config struct {
 	DownHook    string        // script run when a session interface goes down
 	LeaseTTL    time.Duration // sticky lease lifetime after last use; 0 disables expiry
 	FOUPort     uint16        // wrap tunnels in Foo-over-UDP on this port; 0 = plain GRE
+	MSSClamp    config.MSSClamp
 }
 
 // New builds a Manager using the real netlink data-plane.
@@ -117,6 +121,7 @@ func newWith(cfg Config, prov Provisioner) *Manager {
 		downHook:    cfg.DownHook,
 		leaseTTL:    cfg.LeaseTTL,
 		fouPort:     cfg.FOUPort,
+		mssClamp:    cfg.MSSClamp,
 		sessions:    make(map[uint32]*Entry),
 		active:      make(map[string]uint32),
 		leases:      make(map[string]netip.Addr),
@@ -217,6 +222,21 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 		m.mu.Unlock()
 		return control.SessionGrant{}, control.ResultInternal, err
 	}
+	if err := mssclamp.Apply(ctx, m.log, m.mssClamp, ifName, mtu); err != nil {
+		_ = m.prov.Remove(ifName)
+		m.mu.Lock()
+		if m.sessions[sessionKey] == entry {
+			delete(m.sessions, sessionKey)
+			if m.active[p.ClientID] == sessionKey {
+				delete(m.active, p.ClientID)
+			}
+			m.pool.Release(clientInner)
+			delete(m.leases, p.ClientID)
+			delete(m.leaseTimes, p.ClientID)
+		}
+		m.mu.Unlock()
+		return control.SessionGrant{}, control.ResultInternal, err
+	}
 
 	hooks.Run(ctx, m.log, m.upHook, hooks.Info{
 		Event:      "up",
@@ -283,6 +303,9 @@ func (m *Manager) evictLocked(clientID string) *Entry {
 
 // removeAndNotify deletes the interface and runs the down hook for an entry.
 func (m *Manager) removeAndNotify(entry *Entry) {
+	if err := mssclamp.Remove(context.Background(), m.log, m.mssClamp, entry.IfName, entry.MTU); err != nil {
+		m.log.Warn("mss clamp cleanup failed", "iface", entry.IfName, "err", err)
+	}
 	if err := m.prov.Remove(entry.IfName); err != nil {
 		m.log.Warn("interface removal failed", "iface", entry.IfName, "err", err)
 	}

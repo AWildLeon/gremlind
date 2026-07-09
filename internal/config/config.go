@@ -108,11 +108,85 @@ type Config struct {
 	KeepaliveTimeout  Duration `yaml:"keepalive_timeout"`
 	LeaseTTL          Duration `yaml:"lease_ttl"`
 
-	Auth  Auth  `yaml:"auth"`
-	Hooks Hooks `yaml:"hooks"`
+	Auth     Auth     `yaml:"auth"`
+	Hooks    Hooks    `yaml:"hooks"`
+	MSSClamp MSSClamp `yaml:"mss_clamp"`
 
 	// Client holds dialer-role settings (used by `gremlind connect`).
 	Client Client `yaml:"client"`
+}
+
+// MSSClamp optionally installs/removes firewall rules that clamp TCP MSS for
+// traffic entering/leaving gremlind tunnel interfaces.
+type MSSClamp struct {
+	Enabled        bool   `yaml:"enabled"`
+	Backend        string `yaml:"backend"`   // nftables | iptables
+	Direction      string `yaml:"direction"` // out | in | both
+	MSSMode        string `yaml:"mss_mode"`  // pmtu | tunnel_mtu
+	MSS            int    `yaml:"mss"`       // 0 = mode default, >0 = fixed MSS for both families
+	MSS4           int    `yaml:"mss4"`      // overrides mss/mode for IPv4 when >0
+	MSS6           int    `yaml:"mss6"`      // overrides mss/mode for IPv6 when >0
+	NFTFamily      string `yaml:"nft_family"`
+	NFTTable       string `yaml:"nft_table"`
+	NFTChain       string `yaml:"nft_chain"`
+	NFTManageTable bool   `yaml:"nft_manage_table"`
+	IPTablesChain  string `yaml:"iptables_chain"`
+}
+
+func (m MSSClamp) WithDefaults() MSSClamp {
+	if m.Backend == "" {
+		m.Backend = "nftables"
+	}
+	if m.Direction == "" {
+		m.Direction = "out"
+	}
+	if m.MSSMode == "" {
+		m.MSSMode = "pmtu"
+	}
+	if m.NFTFamily == "" {
+		m.NFTFamily = "inet"
+	}
+	if m.NFTTable == "" {
+		m.NFTTable = "gremlind"
+	}
+	if m.NFTChain == "" {
+		m.NFTChain = "forward"
+	}
+	if m.IPTablesChain == "" {
+		m.IPTablesChain = "FORWARD"
+	}
+	return m
+}
+
+func (c *Config) validateMSSClamp() error {
+	m := c.MSSClamp
+	switch m.Backend {
+	case "nftables", "iptables":
+	default:
+		return fmt.Errorf("mss_clamp.backend must be \"nftables\" or \"iptables\", got %q", m.Backend)
+	}
+	switch m.Direction {
+	case "out", "in", "both":
+	default:
+		return fmt.Errorf("mss_clamp.direction must be \"out\", \"in\", or \"both\", got %q", m.Direction)
+	}
+	switch m.MSSMode {
+	case "pmtu", "tunnel_mtu":
+	default:
+		return fmt.Errorf("mss_clamp.mss_mode must be \"pmtu\" or \"tunnel_mtu\", got %q", m.MSSMode)
+	}
+	for field, value := range map[string]int{"mss": m.MSS, "mss4": m.MSS4, "mss6": m.MSS6} {
+		if value < 0 || value > 65535 {
+			return fmt.Errorf("mss_clamp.%s must be between 0 and 65535, got %d", field, value)
+		}
+	}
+	if m.Backend == "nftables" && (m.NFTFamily == "" || m.NFTTable == "" || m.NFTChain == "") {
+		return fmt.Errorf("mss_clamp nft_family, nft_table and nft_chain must be non-empty")
+	}
+	if m.Backend == "iptables" && m.IPTablesChain == "" {
+		return fmt.Errorf("mss_clamp.iptables_chain must be non-empty")
+	}
+	return nil
 }
 
 // Client configures the dialer role.
@@ -199,6 +273,10 @@ func (c *Config) ApplyDefaults() {
 	if c.Client.Iface == "" {
 		c.Client.Iface = DefaultIface
 	}
+	if c.MSSClamp.Enabled && (c.MSSClamp.Backend == "" || c.MSSClamp.Backend == "nftables") && c.MSSClamp.NFTTable == "" && c.MSSClamp.NFTChain == "" {
+		c.MSSClamp.NFTManageTable = true
+	}
+	c.MSSClamp = c.MSSClamp.WithDefaults()
 	if c.Client.SourceFallback == "" {
 		c.Client.SourceFallback = "fail"
 	}
@@ -241,6 +319,11 @@ func (c *Config) validate() error {
 	}
 	if c.LeaseTTL.Std() < 0 {
 		return fmt.Errorf("lease_ttl must be >= 0, got %s", c.LeaseTTL.Std())
+	}
+	if c.MSSClamp.Enabled {
+		if err := c.validateMSSClamp(); err != nil {
+			return err
+		}
 	}
 	if _, err := c.AdminMode(); err != nil {
 		return err
