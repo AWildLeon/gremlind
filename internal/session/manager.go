@@ -98,6 +98,10 @@ func NewWithProvisioner(cfg Config, prov Provisioner) *Manager {
 }
 
 func newWith(cfg Config, prov Provisioner) *Manager {
+	if cfg.FOUPort != 0 {
+		cfg.UseGREKey = false
+		cfg.UseGRESeq = false
+	}
 	outer := cfg.OuterMTU
 	if outer == 0 {
 		if m, err := gre.OuterMTU(cfg.GRELocal); err == nil {

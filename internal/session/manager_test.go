@@ -131,6 +131,40 @@ func TestEstablishCanEnableGRESequenceNumbers(t *testing.T) {
 	}
 }
 
+func TestFOUForcesGREKeyAndSequenceOff(t *testing.T) {
+	prov := &fakeProv{}
+	server := netip.MustParseAddr("fd00:9::1")
+	pool, err := ippool.New(netip.MustParsePrefix("fd00:9::/112"), server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newWith(Config{
+		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Pool:        pool,
+		ServerInner: server,
+		GRELocal:    netip.MustParseAddr("2001:db8::10"),
+		OuterMTU:    1500,
+		UseGREKey:   true,
+		UseGRESeq:   true,
+		FOUPort:     5555,
+	}, prov)
+
+	grant, res, err := m.Establish(context.Background(), control.SessionParams{
+		ClientID:    "site-a",
+		ClientOuter: netip.MustParseAddr("2001:db8::20"),
+		OuterMTU:    1500,
+	})
+	if err != nil || res != control.ResultOK {
+		t.Fatalf("establish: res=%s err=%v", res, err)
+	}
+	if grant.GREKey != 0 || grant.TunnelFlags&(control.TunnelFlagGREKey|control.TunnelFlagGRESeq) != 0 {
+		t.Fatalf("grant key=%d flags=0x%x, want no key/seq", grant.GREKey, grant.TunnelFlags)
+	}
+	if len(prov.ensured) != 1 || prov.ensured[0].Key != 0 || prov.ensured[0].Seq {
+		t.Fatalf("provisioned params = %+v, want no key/seq", prov.ensured)
+	}
+}
+
 func TestNegotiateMTUTakesMinimumAndCap(t *testing.T) {
 	prov := &fakeProv{}
 	m, _ := newTestManager(t, 1500, 1400, prov)

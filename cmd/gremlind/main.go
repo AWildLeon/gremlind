@@ -117,12 +117,14 @@ func runServer(args []string) error {
 	if err != nil {
 		return err
 	}
-	// FOU already demultiplexes/identifies the tunnel by outer UDP port +
-	// address, so the GRE key field is redundant weight on every packet —
-	// force it off regardless of the configured gre_key, saving 4 bytes.
+	// FOU already demultiplexes by UDP port + outer addresses, so GRE key and
+	// sequence fields are redundant extra bytes. Force both off regardless of
+	// gre_key/gre_seq whenever GRE is wrapped in UDP.
 	useGREKey := cfg.GREKeyEnabled()
+	useGRESeq := cfg.GRESeqEnabled()
 	if cfg.FOUPort != 0 {
 		useGREKey = false
+		useGRESeq = false
 	}
 	sessCfg := session.Config{
 		Log:         log,
@@ -131,7 +133,7 @@ func runServer(args []string) error {
 		GRELocal:    greLocal,
 		MTUCap:      cfg.MTU,
 		UseGREKey:   useGREKey,
-		UseGRESeq:   cfg.GRESeqEnabled(),
+		UseGRESeq:   useGRESeq,
 		UpHook:      cfg.Hooks.Up,
 		DownHook:    cfg.Hooks.Down,
 		LeaseTTL:    cfg.LeaseTTL.Std(),
@@ -142,7 +144,7 @@ func runServer(args []string) error {
 		if err := gre.EnsureFOUReceive(cfg.FOUPort); err != nil {
 			return fmt.Errorf("server: %w", err)
 		}
-		log.Info("gre-over-udp (fou) enabled, gre key forced off", "port", cfg.FOUPort)
+		log.Info("gre-over-udp (fou) enabled, gre key and sequence fields forced off", "port", cfg.FOUPort)
 	}
 	var mgr *session.Manager
 	if cfg.NetlinkSocket != "" {
@@ -442,16 +444,22 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 	if err != nil {
 		return netip.Addr{}, false, err
 	}
+	effectiveGREKey := sess.GREKey
+	effectiveGRESeq := sess.TunnelFlags&control.TunnelFlagGRESeq != 0
+	if cfg.FOUPort != 0 {
+		effectiveGREKey = 0
+		effectiveGRESeq = false
+	}
 	log.Info("session established",
 		"inner", sess.ClientInner, "server_inner", sess.ServerInner,
-		"gre_key", sess.GREKey, "mtu", sess.MTU)
+		"gre_key", effectiveGREKey, "gre_seq", effectiveGRESeq, "mtu", sess.MTU)
 
 	if err := prov.Ensure(gre.Params{
 		Name:       ifName,
 		Local:      clientOuter,
 		Remote:     sess.ServerOuter,
-		Key:        sess.GREKey,
-		Seq:        sess.TunnelFlags&control.TunnelFlagGRESeq != 0,
+		Key:        effectiveGREKey,
+		Seq:        effectiveGRESeq,
 		MTU:        int(sess.MTU),
 		InnerLocal: sess.ClientInner,
 		InnerPeer:  sess.ServerInner,
@@ -474,7 +482,7 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 		InnerPeer:  sess.ServerInner,
 		OuterLocal: clientOuter,
 		OuterPeer:  sess.ServerOuter,
-		GREKey:     sess.GREKey,
+		GREKey:     effectiveGREKey,
 		MTU:        int(sess.MTU),
 	}
 	upInfo := hookInfo
