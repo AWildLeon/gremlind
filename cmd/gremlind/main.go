@@ -24,6 +24,7 @@ import (
 	"gremlind/internal/control"
 	"gremlind/internal/gre"
 	"gremlind/internal/hardening"
+	"gremlind/internal/healthcheck"
 	"gremlind/internal/hooks"
 	"gremlind/internal/ippool"
 	"gremlind/internal/mssclamp"
@@ -503,7 +504,26 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 		hooks.Run(context.Background(), log, cfg.Hooks.Down, downInfo)
 	}()
 
-	return sess.ClientInner, true, cl.KeepaliveLoop(ctx, conn)
+	return sess.ClientInner, true, runSessionLoops(ctx, log, cfg, cl, conn, ifName, sess.ServerInner)
+}
+
+func runSessionLoops(ctx context.Context, log *slog.Logger, cfg *config.Config, cl *control.Client, conn net.Conn, ifName string, innerPeer netip.Addr) error {
+	if !cfg.HealthCheck.Enabled {
+		return cl.KeepaliveLoop(ctx, conn)
+	}
+	loopCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- cl.KeepaliveLoop(loopCtx, conn) }()
+	go func() { errCh <- healthcheck.Loop(loopCtx, log, cfg.HealthCheck, ifName, innerPeer) }()
+
+	err := <-errCh
+	cancel()
+	if err == nil && ctx.Err() != nil {
+		return nil
+	}
+	return err
 }
 
 func runStatus(args []string) error {

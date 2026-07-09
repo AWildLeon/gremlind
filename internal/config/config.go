@@ -108,12 +108,103 @@ type Config struct {
 	KeepaliveTimeout  Duration `yaml:"keepalive_timeout"`
 	LeaseTTL          Duration `yaml:"lease_ttl"`
 
-	Auth     Auth     `yaml:"auth"`
-	Hooks    Hooks    `yaml:"hooks"`
-	MSSClamp MSSClamp `yaml:"mss_clamp"`
+	Auth        Auth        `yaml:"auth"`
+	Hooks       Hooks       `yaml:"hooks"`
+	MSSClamp    MSSClamp    `yaml:"mss_clamp"`
+	HealthCheck HealthCheck `yaml:"healthcheck"`
 
 	// Client holds dialer-role settings (used by `gremlind connect`).
 	Client Client `yaml:"client"`
+}
+
+// HealthCheck verifies data-plane reachability through the tunnel.
+type HealthCheck struct {
+	Enabled              bool     `yaml:"enabled"`
+	Interval             Duration `yaml:"interval"`
+	Timeout              Duration `yaml:"timeout"`
+	Failures             int      `yaml:"failures"`
+	Actions              []string `yaml:"actions"`                // ordered: log | run_script | reconnect
+	Script               string   `yaml:"script"`                 // used by run_script action
+	Target               string   `yaml:"target"`                 // empty = negotiated inner peer
+	PacketSize           int      `yaml:"packet_size"`            // ping payload bytes; 0 = ping default
+	PacketSizes          []int    `yaml:"packet_sizes"`           // optional set of payload sizes to probe
+	InterPacketDelay     Duration `yaml:"inter_packet_delay"`     // delay between packet-size probes
+	LargePacketDelay     Duration `yaml:"large_packet_delay"`     // delay before probes >= threshold; 0 = inter_packet_delay
+	LargePacketThreshold int      `yaml:"large_packet_threshold"` // payload bytes; 0 = any non-default size
+	Command              string   `yaml:"command"`                // ping-compatible binary
+	BindInterface        bool     `yaml:"bind_interface"`         // pass -I <iface>
+}
+
+func (h HealthCheck) WithDefaults() HealthCheck {
+	if h.Interval == 0 {
+		h.Interval = Duration(30 * time.Second)
+	}
+	if h.Timeout == 0 {
+		h.Timeout = Duration(3 * time.Second)
+	}
+	if h.Failures == 0 {
+		h.Failures = 3
+	}
+	if len(h.Actions) == 0 {
+		h.Actions = []string{"log"}
+	}
+	if h.Command == "" {
+		h.Command = "ping"
+	}
+	return h
+}
+
+func (c *Config) validateHealthCheck() error {
+	h := c.HealthCheck
+	if h.Interval.Std() <= 0 {
+		return fmt.Errorf("healthcheck.interval must be positive, got %s", h.Interval.Std())
+	}
+	if h.Timeout.Std() <= 0 {
+		return fmt.Errorf("healthcheck.timeout must be positive, got %s", h.Timeout.Std())
+	}
+	if h.Failures <= 0 {
+		return fmt.Errorf("healthcheck.failures must be positive, got %d", h.Failures)
+	}
+	usesScript := false
+	for i, action := range h.Actions {
+		switch action {
+		case "log", "run_script", "reconnect":
+			if action == "run_script" {
+				usesScript = true
+			}
+		default:
+			return fmt.Errorf("healthcheck.actions[%d] must be \"log\", \"run_script\", or \"reconnect\", got %q", i, action)
+		}
+	}
+	if usesScript && h.Script == "" {
+		return fmt.Errorf("healthcheck.script is required when actions contains run_script")
+	}
+	if h.Target != "" {
+		if _, err := netip.ParseAddr(h.Target); err != nil {
+			return fmt.Errorf("invalid healthcheck.target %q: %w", h.Target, err)
+		}
+	}
+	if h.PacketSize < 0 || h.PacketSize > 65507 {
+		return fmt.Errorf("healthcheck.packet_size must be between 0 and 65507, got %d", h.PacketSize)
+	}
+	for i, size := range h.PacketSizes {
+		if size < 0 || size > 65507 {
+			return fmt.Errorf("healthcheck.packet_sizes[%d] must be between 0 and 65507, got %d", i, size)
+		}
+	}
+	if h.InterPacketDelay.Std() < 0 {
+		return fmt.Errorf("healthcheck.inter_packet_delay must be >= 0, got %s", h.InterPacketDelay.Std())
+	}
+	if h.LargePacketDelay.Std() < 0 {
+		return fmt.Errorf("healthcheck.large_packet_delay must be >= 0, got %s", h.LargePacketDelay.Std())
+	}
+	if h.LargePacketThreshold < 0 || h.LargePacketThreshold > 65507 {
+		return fmt.Errorf("healthcheck.large_packet_threshold must be between 0 and 65507, got %d", h.LargePacketThreshold)
+	}
+	if h.Command == "" {
+		return fmt.Errorf("healthcheck.command must be non-empty")
+	}
+	return nil
 }
 
 // MSSClamp optionally installs/removes firewall rules that clamp TCP MSS for
@@ -277,6 +368,7 @@ func (c *Config) ApplyDefaults() {
 		c.MSSClamp.NFTManageTable = true
 	}
 	c.MSSClamp = c.MSSClamp.WithDefaults()
+	c.HealthCheck = c.HealthCheck.WithDefaults()
 	if c.Client.SourceFallback == "" {
 		c.Client.SourceFallback = "fail"
 	}
@@ -322,6 +414,11 @@ func (c *Config) validate() error {
 	}
 	if c.MSSClamp.Enabled {
 		if err := c.validateMSSClamp(); err != nil {
+			return err
+		}
+	}
+	if c.HealthCheck.Enabled {
+		if err := c.validateHealthCheck(); err != nil {
 			return err
 		}
 	}

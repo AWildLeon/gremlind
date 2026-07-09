@@ -90,6 +90,20 @@ PMTU clamping by default, fixed MSS values via `mss` or per-protocol `mss4` /
 `mss6` overrides, or `mss_mode = "tunnel_mtu"` to derive fixed values from the
 negotiated tunnel MTU (`MTU-40` for IPv4 and `MTU-60` for IPv6).
 
+### Inside-tunnel healthchecks
+
+`healthcheck` can make the dialer periodically ping the negotiated inner peer
+through the tunnel interface. If the control TCP connection stays alive but GRE
+forwarding breaks, repeated healthcheck failures tear the session down so the
+normal reconnect path can rebuild it when configured to do so. By default,
+threshold failures only log (`actions: ["log"]`); add ordered actions such as
+`["log", "run_script", "reconnect"]` to run a remediation script and/or tear down
+so the reconnect path rebuilds the tunnel. `run_script` uses `healthcheck.script`
+and receives `GREMLIND_HEALTHCHECK_*` environment variables. `packet_size` or
+`packet_sizes` can probe specific ping payload sizes to catch
+size-dependent blackholes; `inter_packet_delay`, `large_packet_delay`, and
+`large_packet_threshold` add spacing around larger probes.
+
 ### Up/down hooks
 
 When a tunnel comes up or down, the configured `hooks.up` / `hooks.down` script

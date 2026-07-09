@@ -73,6 +73,21 @@ mss_clamp:
   nft_family: "inet"
   nft_table: "gremlind"
   nft_chain: "forward"
+healthcheck:
+  enabled: true
+  interval: 10s
+  timeout: 1s
+  failures: 2
+  actions: ["log", "run_script", "reconnect"]
+  script: "/run/current-system/sw/bin/true"
+  target: "fd00:9::1"
+  packet_size: 1200
+  packet_sizes: [0, 1200, 1372]
+  inter_packet_delay: 250ms
+  large_packet_delay: 2s
+  large_packet_threshold: 1200
+  command: "ping"
+  bind_interface: true
 client:
   source_fallback: "kernel"
   source_rules:
@@ -104,6 +119,9 @@ client:
 	if !c.MSSClamp.Enabled || c.MSSClamp.Backend != "nftables" || c.MSSClamp.Direction != "both" || c.MSSClamp.MSSMode != "tunnel_mtu" || c.MSSClamp.MSS != 1360 || c.MSSClamp.MSS4 != 1360 || c.MSSClamp.MSS6 != 1340 {
 		t.Fatalf("mss_clamp = %+v", c.MSSClamp)
 	}
+	if !c.HealthCheck.Enabled || c.HealthCheck.Failures != 2 || len(c.HealthCheck.Actions) != 3 || c.HealthCheck.Actions[1] != "run_script" || c.HealthCheck.Script == "" || c.HealthCheck.Target != "fd00:9::1" || c.HealthCheck.PacketSize != 1200 || len(c.HealthCheck.PacketSizes) != 3 || c.HealthCheck.InterPacketDelay.Std() != 250*time.Millisecond || c.HealthCheck.LargePacketDelay.Std() != 2*time.Second || c.HealthCheck.LargePacketThreshold != 1200 || !c.HealthCheck.BindInterface {
+		t.Fatalf("healthcheck = %+v", c.HealthCheck)
+	}
 	if len(c.Client.SourceRules) != 1 {
 		t.Fatalf("source_rules len = %d, want 1", len(c.Client.SourceRules))
 	}
@@ -129,6 +147,33 @@ func TestInvalidSourceRuleExcludeSubnet(t *testing.T) {
 	c.ApplyDefaults()
 	if err := c.validate(); err == nil {
 		t.Fatal("validate succeeded with invalid source exclude subnet")
+	}
+}
+
+func TestInvalidHealthCheck(t *testing.T) {
+	for name, hc := range map[string]HealthCheck{
+		"interval":               {Enabled: true, Interval: Duration(-time.Second)},
+		"timeout":                {Enabled: true, Timeout: Duration(-time.Second)},
+		"failures":               {Enabled: true, Failures: -1},
+		"actions":                {Enabled: true, Actions: []string{"panic"}},
+		"script":                 {Enabled: true, Actions: []string{"run_script"}},
+		"target":                 {Enabled: true, Target: "not-an-ip"},
+		"packet_size":            {Enabled: true, PacketSize: -1},
+		"packet_sizes":           {Enabled: true, PacketSizes: []int{0, 70000}},
+		"inter_packet_delay":     {Enabled: true, InterPacketDelay: Duration(-time.Second)},
+		"large_packet_delay":     {Enabled: true, LargePacketDelay: Duration(-time.Second)},
+		"large_packet_threshold": {Enabled: true, LargePacketThreshold: -1},
+		"command":                {Enabled: true, Command: ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := &Config{Listen: "[::1]:4747", HealthCheck: hc}
+			if name != "command" {
+				c.ApplyDefaults()
+			}
+			if err := c.validate(); err == nil {
+				t.Fatal("validate succeeded, want error")
+			}
+		})
 	}
 }
 

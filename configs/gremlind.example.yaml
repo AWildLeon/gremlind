@@ -87,6 +87,26 @@ mss_clamp:
   nft_manage_table: true
   iptables_chain: "FORWARD"
 
+# Optional dialer-side data-plane healthcheck. This probes the negotiated inner
+# peer address through the tunnel interface; after N consecutive failures the
+# dialer tears down and reconnects, catching cases where the TCP control channel
+# is alive but GRE forwarding is wedged. `target` can override the peer address.
+healthcheck:
+  enabled: false
+  interval: 30s
+  timeout: 3s
+  failures: 3
+  actions: ["log"] # ordered actions after threshold: log, run_script, reconnect
+  script: "" # required when actions contains run_script
+  target: ""
+  packet_size: 0 # ping payload bytes; 0 = ping default
+  # packet_sizes: [0, 1200, 1372] # optional: probe multiple payload sizes
+  inter_packet_delay: 0s # delay between packet-size probes
+  large_packet_delay: 2s # extra spacing before probes >= threshold; 0s = inter_packet_delay
+  large_packet_threshold: 1200
+  command: "ping"
+  bind_interface: true
+
 auth:
   # Use a high-entropy secret; the HMAC handshake is resistant to passive replay
   # but captured handshakes can still be used for offline guessing of weak PSKs.
