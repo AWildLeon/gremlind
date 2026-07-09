@@ -676,7 +676,7 @@ func chooseSourceAddressFromRule(ifaces []net.Interface, serverAddrs []netip.Add
 			}
 			seenAllowed[iface.Name] = true
 		}
-		if iface.Flags&net.FlagUp == 0 {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
 		addrs, err := iface.Addrs()
@@ -741,7 +741,7 @@ func ifaceAddrIP(raw net.Addr) (netip.Addr, bool) {
 		return netip.Addr{}, false
 	}
 	addr := prefix.Addr().Unmap()
-	if !addr.IsValid() || addr.IsUnspecified() || addr.IsMulticast() {
+	if !addr.IsValid() || addr.IsUnspecified() || addr.IsMulticast() || addr.IsLoopback() || addr.IsLinkLocalUnicast() {
 		return netip.Addr{}, false
 	}
 	return addr, true
