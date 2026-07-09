@@ -290,6 +290,14 @@ func linkMTUByAddr(outer netip.Addr) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	mtu, err := linkMTUByIndex(idx)
+	if err != nil {
+		return 0, err
+	}
+	return mtu, nil
+}
+
+func linkMTUByIndex(idx int32) (int, error) {
 	m := newNlmsg(unix.RTM_GETLINK, unix.NLM_F_REQUEST|unix.NLM_F_DUMP)
 	m.put(make([]byte, unix.SizeofIfInfomsg))
 	msgs, err := nlExec(m.finalize(), true)
@@ -309,7 +317,68 @@ func linkMTUByAddr(outer netip.Addr) (int, error) {
 			}
 		}
 	}
-	return 0, fmt.Errorf("gre: MTU not found for %s", outer)
+	return 0, fmt.Errorf("gre: MTU not found for ifindex %d", idx)
+}
+
+// pathMTU asks the kernel how packets from local to remote would be routed and
+// returns that route's MTU. This is more accurate than looking up the interface
+// owning the source address when the address lives on a dummy/loopback device,
+// when policy routing chooses another egress link, or when a cached PMTU/route
+// MTU is lower than the link MTU.
+func pathMTU(local, remote netip.Addr) (int, error) {
+	if !local.IsValid() || !remote.IsValid() || local.Is6() != remote.Is6() {
+		return 0, fmt.Errorf("gre: invalid MTU route lookup local=%s remote=%s", local, remote)
+	}
+
+	const (
+		rtaDst     = 1
+		rtaSrc     = 2
+		rtaOIF     = 4
+		rtaMetrics = 8
+		rtaxMTU    = 2
+	)
+
+	m := newNlmsg(unix.RTM_GETROUTE, unix.NLM_F_REQUEST)
+	rtm := make([]byte, unix.SizeofRtMsg)
+	rtm[0] = addrFamily(remote)
+	rtm[1] = byte(remote.BitLen()) // Dst_len
+	rtm[2] = byte(local.BitLen())  // Src_len
+	m.put(rtm)
+	m.attr(rtaDst, remote.AsSlice())
+	m.attr(rtaSrc, local.AsSlice())
+
+	msgs, err := nlExec(m.finalize(), false)
+	if err != nil {
+		return 0, err
+	}
+	for _, p := range msgs {
+		if len(p) < unix.SizeofRtMsg {
+			continue
+		}
+		var ifindex int32
+		var routeMTU int
+		for _, a := range parseAttrs(p[unix.SizeofRtMsg:]) {
+			switch a.typ {
+			case rtaOIF:
+				if len(a.data) >= 4 {
+					ifindex = int32(native.Uint32(a.data))
+				}
+			case rtaMetrics:
+				for _, ma := range parseAttrs(a.data) {
+					if ma.typ == rtaxMTU && len(ma.data) >= 4 {
+						routeMTU = int(native.Uint32(ma.data))
+					}
+				}
+			}
+		}
+		if routeMTU > 0 {
+			return routeMTU, nil
+		}
+		if ifindex != 0 {
+			return linkMTUByIndex(ifindex)
+		}
+	}
+	return 0, fmt.Errorf("gre: route MTU not found for %s -> %s", local, remote)
 }
 
 // addrOwner dumps addresses and returns the index of the link owning outer.

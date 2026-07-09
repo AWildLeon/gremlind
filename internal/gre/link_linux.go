@@ -171,8 +171,13 @@ func RemovePrefix(prefix string) ([]string, error) {
 	return removed, nil
 }
 
-// OuterMTU returns the MTU of the interface that owns the local outer address,
-// letting the server contribute its real link MTU to negotiation.
+// OuterMTU returns the MTU of the interface that owns the local outer address.
 func OuterMTU(local netip.Addr) (int, error) {
 	return linkMTUByAddr(local)
+}
+
+// OuterMTUForPath returns the kernel route MTU for packets from local to remote,
+// falling back to the egress link MTU when the route has no explicit/cached PMTU.
+func OuterMTUForPath(local, remote netip.Addr) (int, error) {
+	return pathMTU(local, remote)
 }

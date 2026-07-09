@@ -125,6 +125,30 @@ type Client struct {
 	// this explicitly when a host runs more than one connect instance at
 	// once (each needs its own interface name — see -iface / DefaultIface).
 	Iface string `yaml:"iface"`
+	// SourceRules constrain which local source address may be used for the
+	// control connection, and therefore for the GRE outer endpoint advertised
+	// to the server. The first rule that yields a usable address wins.
+	SourceRules []SourceRule `yaml:"source_rules"`
+	// SourceFallback controls what happens when SourceRules are configured but no
+	// rule matches. "fail" is strict; "kernel" leaves source selection to the OS.
+	SourceFallback string `yaml:"source_fallback"`
+}
+
+// SourceRule selects candidate local source addresses for the dialer.
+type SourceRule struct {
+	// Ifaces, when non-empty, restricts candidates to addresses configured on
+	// these interface names. Empty means all up interfaces.
+	Ifaces []string `yaml:"ifaces"`
+	// Family optionally restricts candidate/source server families: "ipv4",
+	// "ipv6", or "any"/"".
+	Family string `yaml:"family"`
+	// MatchServerSubnets makes the rule apply only when the configured server
+	// resolves to at least one address in these CIDR prefixes.
+	MatchServerSubnets []string `yaml:"match_server_subnets"`
+	// IncludeSubnets, when non-empty, only allows candidates inside these CIDRs.
+	IncludeSubnets []string `yaml:"include_subnets"`
+	// ExcludeSubnets removes candidates contained in any listed CIDR prefix.
+	ExcludeSubnets []string `yaml:"exclude_subnets"`
 }
 
 // DefaultListen is used when Listen is empty. It is v6-native/dual-stack.
@@ -174,6 +198,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Client.Iface == "" {
 		c.Client.Iface = DefaultIface
+	}
+	if c.Client.SourceFallback == "" {
+		c.Client.SourceFallback = "fail"
 	}
 }
 
@@ -226,6 +253,29 @@ func (c *Config) validate() error {
 	if c.GRELocal != "" {
 		if _, err := netip.ParseAddr(c.GRELocal); err != nil {
 			return fmt.Errorf("invalid gre_local %q: %w", c.GRELocal, err)
+		}
+	}
+	switch c.Client.SourceFallback {
+	case "", "fail", "kernel":
+	default:
+		return fmt.Errorf("client.source_fallback must be \"fail\" or \"kernel\", got %q", c.Client.SourceFallback)
+	}
+	for i, rule := range c.Client.SourceRules {
+		switch rule.Family {
+		case "", "any", "ipv4", "ipv6":
+		default:
+			return fmt.Errorf("client.source_rules[%d].family must be \"ipv4\", \"ipv6\", or \"any\", got %q", i, rule.Family)
+		}
+		for field, prefixes := range map[string][]string{
+			"match_server_subnets": rule.MatchServerSubnets,
+			"include_subnets":      rule.IncludeSubnets,
+			"exclude_subnets":      rule.ExcludeSubnets,
+		} {
+			for _, prefix := range prefixes {
+				if _, err := netip.ParsePrefix(prefix); err != nil {
+					return fmt.Errorf("invalid client.source_rules[%d].%s prefix %q: %w", i, field, prefix, err)
+				}
+			}
 		}
 	}
 	return nil

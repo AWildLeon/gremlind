@@ -72,6 +72,16 @@ Use `-secret-env NAME` to read from a different variable. Precedence is
 See [configs/gremlind.example.yaml](configs/gremlind.example.yaml) for a fully
 commented configuration.
 
+### Dialer source address rules
+
+`client.source_rules` can constrain the local address used by `gremlind connect`.
+Rules are tried in order; each rule may match server prefixes, restrict address
+family, restrict candidate addresses to specific `ifaces`, require candidates to
+be in `include_subnets`, and remove unwanted ranges with `exclude_subnets`. The
+selected address is bound on the TCP control connection and becomes the GRE outer
+address advertised to the server. `client.source_fallback = "kernel"` can opt
+out of strict failure when no rule matches.
+
 ### Up/down hooks
 
 When a tunnel comes up or down, the configured `hooks.up` / `hooks.down` script

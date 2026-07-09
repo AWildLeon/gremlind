@@ -134,7 +134,11 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 			fmt.Errorf("outer family mismatch: client %s vs server %s", p.ClientOuter, m.greLocal)
 	}
 
-	mtu := m.negotiateMTU(int(p.OuterMTU))
+	serverOuterMTU := m.outerMTU
+	if pathMTU, err := gre.OuterMTUForPath(m.greLocal, p.ClientOuter); err == nil {
+		serverOuterMTU = pathMTU
+	}
+	mtu := m.negotiateMTUWithServerOuter(serverOuterMTU, int(p.OuterMTU))
 
 	// Under the lock: evict any stale session for the same client (roaming —
 	// the client reconnected, likely from a new outer IP), then assign the inner
@@ -300,7 +304,14 @@ func (m *Manager) removeAndNotify(entry *Entry) {
 // non-positive or wrapped value even if an authenticated peer reports a bogus
 // tiny outer MTU.
 func (m *Manager) negotiateMTU(clientOuterMTU int) int {
-	outer := m.outerMTU
+	return m.negotiateMTUWithServerOuter(m.outerMTU, clientOuterMTU)
+}
+
+func (m *Manager) negotiateMTUWithServerOuter(serverOuterMTU, clientOuterMTU int) int {
+	outer := serverOuterMTU
+	if outer <= 0 {
+		outer = m.outerMTU
+	}
 	if clientOuterMTU > 0 && clientOuterMTU < outer {
 		outer = clientOuterMTU
 	}

@@ -73,6 +73,20 @@ auth:
   #   site-a: "replace-with-random-secret-for-site-a"
   #   site-b: "replace-with-random-secret-for-site-b"
 
+client:
+  # Optional source-address selection rules for `gremlind connect`. The first
+  # rule yielding a usable address wins. This controls the TCP control-channel
+  # source address and therefore the GRE outer address advertised to the server.
+  # If rules are configured but none match, source_fallback decides whether to
+  # fail loudly (default) or let the kernel pick normally ("kernel").
+  source_fallback: "fail"
+  # source_rules:
+  #   - family: "ipv6"                  # ipv4 | ipv6 | any
+  #     match_server_subnets: ["2001:db8:feed::/48"]
+  #     ifaces: ["ppp0", "wan0"]        # empty/missing = all up interfaces
+  #     include_subnets: ["2001:db8:1234::/48"]
+  #     exclude_subnets: ["fe80::/10", "fd00::/8", "10.0.0.0/8"]
+
 # Optional pppd-style hooks run on interface up/down.
 hooks:
   up: ""

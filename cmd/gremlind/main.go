@@ -377,6 +377,12 @@ func runDialer(ctx context.Context, log *slog.Logger, cfg *config.Config, server
 // actually established.
 func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server, clientID, secret, ifName string, requestedInner netip.Addr) (netip.Addr, bool, error) {
 	var d net.Dialer
+	if local, err := chooseSourceAddress(ctx, server, cfg.Client.SourceRules, cfg.Client.SourceFallback); err != nil {
+		return netip.Addr{}, false, err
+	} else if local.IsValid() {
+		d.LocalAddr = &net.TCPAddr{IP: net.IP(local.AsSlice())}
+		log.Debug("using configured source address", "addr", local)
+	}
 	conn, err := d.DialContext(ctx, "tcp", server)
 	if err != nil {
 		return netip.Addr{}, false, fmt.Errorf("dial %s: %w", server, err)
@@ -387,6 +393,7 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 	if !clientOuter.IsValid() {
 		return netip.Addr{}, false, fmt.Errorf("could not determine local outer address")
 	}
+	serverOuter := remoteOuter(conn)
 	outerMTU := 1500
 	var prov interface {
 		Ensure(gre.Params) error
@@ -395,10 +402,23 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 	if cfg.NetlinkSocket != "" {
 		broker := provisionrpc.Client{Path: cfg.NetlinkSocket}
 		prov = broker
-		if m, err := broker.OuterMTU(clientOuter); err == nil {
+		var err error
+		if serverOuter.IsValid() {
+			outerMTU, err = broker.OuterMTUForPath(clientOuter, serverOuter)
+		} else {
+			outerMTU, err = broker.OuterMTU(clientOuter)
+		}
+		if err != nil {
+			log.Debug("outer MTU detection via netlink broker failed, assuming 1500", "err", err)
+			outerMTU = 1500
+		}
+	} else if serverOuter.IsValid() {
+		if m, err := gre.OuterMTUForPath(clientOuter, serverOuter); err == nil {
+			outerMTU = m
+		} else if m, err := gre.OuterMTU(clientOuter); err == nil {
 			outerMTU = m
 		} else {
-			log.Debug("outer MTU detection via netlink broker failed, assuming 1500", "err", err)
+			log.Debug("outer MTU detection failed, assuming 1500", "err", err)
 		}
 	} else if m, err := gre.OuterMTU(clientOuter); err == nil {
 		outerMTU = m
@@ -520,10 +540,188 @@ func secretFromInputs(secretFlag, secretEnv string, cfg *config.Config) string {
 
 // localOuter extracts the local IP of an established connection.
 func localOuter(conn net.Conn) netip.Addr {
-	if tcp, ok := conn.LocalAddr().(*net.TCPAddr); ok {
+	return tcpAddrIP(conn.LocalAddr())
+}
+
+// remoteOuter extracts the peer IP of an established connection.
+func remoteOuter(conn net.Conn) netip.Addr {
+	return tcpAddrIP(conn.RemoteAddr())
+}
+
+func tcpAddrIP(addr net.Addr) netip.Addr {
+	if tcp, ok := addr.(*net.TCPAddr); ok {
 		if ip, ok := netip.AddrFromSlice(tcp.IP); ok {
 			return ip.Unmap()
 		}
 	}
 	return netip.Addr{}
+}
+
+func chooseSourceAddress(ctx context.Context, server string, rules []config.SourceRule, fallback string) (netip.Addr, error) {
+	if len(rules) == 0 {
+		return netip.Addr{}, nil
+	}
+	serverAddrs, err := resolveServerAddrs(ctx, server)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("list interfaces for source selection: %w", err)
+	}
+	for i, rule := range rules {
+		addr, err := chooseSourceAddressFromRule(ifaces, serverAddrs, rule)
+		if err != nil {
+			return netip.Addr{}, fmt.Errorf("client.source_rules[%d]: %w", i, err)
+		}
+		if addr.IsValid() {
+			return addr, nil
+		}
+	}
+	if fallback == "kernel" {
+		return netip.Addr{}, nil
+	}
+	return netip.Addr{}, fmt.Errorf("no local source address matched client.source_rules for %s", server)
+}
+
+func resolveServerAddrs(ctx context.Context, server string) ([]netip.Addr, error) {
+	host, _, err := net.SplitHostPort(server)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server address %q: %w", server, err)
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return []netip.Addr{ip.Unmap()}, nil
+	}
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve server %q for source selection: %w", host, err)
+	}
+	out := make([]netip.Addr, 0, len(ips))
+	for _, ip := range ips {
+		out = append(out, ip.Unmap())
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("resolve server %q for source selection: no addresses", host)
+	}
+	return out, nil
+}
+
+func chooseSourceAddressFromRule(ifaces []net.Interface, serverAddrs []netip.Addr, rule config.SourceRule) (netip.Addr, error) {
+	families, applies, err := sourceRuleFamilies(serverAddrs, rule)
+	if err != nil || !applies {
+		return netip.Addr{}, err
+	}
+	allowedIfaces := map[string]bool{}
+	for _, name := range rule.Ifaces {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			allowedIfaces[name] = true
+		}
+	}
+	includes, err := parsePrefixes("include_subnets", rule.IncludeSubnets)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	excludes, err := parsePrefixes("exclude_subnets", rule.ExcludeSubnets)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	seenAllowed := map[string]bool{}
+	for _, iface := range ifaces {
+		if len(allowedIfaces) > 0 {
+			if !allowedIfaces[iface.Name] {
+				continue
+			}
+			seenAllowed[iface.Name] = true
+		}
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, raw := range addrs {
+			addr, ok := ifaceAddrIP(raw)
+			if !ok || !families[addr.Is6()] || !includedSource(addr, includes) || excludedSource(addr, excludes) {
+				continue
+			}
+			return addr, nil
+		}
+	}
+	for name := range allowedIfaces {
+		if !seenAllowed[name] {
+			return netip.Addr{}, fmt.Errorf("interface %q not found", name)
+		}
+	}
+	return netip.Addr{}, nil
+}
+
+func sourceRuleFamilies(serverAddrs []netip.Addr, rule config.SourceRule) (map[bool]bool, bool, error) {
+	serverMatches, err := parsePrefixes("match_server_subnets", rule.MatchServerSubnets)
+	if err != nil {
+		return nil, false, err
+	}
+	families := map[bool]bool{}
+	for _, addr := range serverAddrs {
+		if !includedSource(addr, serverMatches) {
+			continue
+		}
+		families[addr.Is6()] = true
+	}
+	if len(families) == 0 {
+		return nil, false, nil
+	}
+	switch rule.Family {
+	case "ipv4":
+		families[true] = false
+	case "ipv6":
+		families[false] = false
+	}
+	return families, families[false] || families[true], nil
+}
+
+func parsePrefixes(field string, raw []string) ([]netip.Prefix, error) {
+	prefixes := make([]netip.Prefix, 0, len(raw))
+	for _, s := range raw {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s prefix %q: %w", field, s, err)
+		}
+		prefixes = append(prefixes, p)
+	}
+	return prefixes, nil
+}
+
+func ifaceAddrIP(raw net.Addr) (netip.Addr, bool) {
+	prefix, err := netip.ParsePrefix(raw.String())
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	addr := prefix.Addr().Unmap()
+	if !addr.IsValid() || addr.IsUnspecified() || addr.IsMulticast() {
+		return netip.Addr{}, false
+	}
+	return addr, true
+}
+
+func includedSource(addr netip.Addr, includes []netip.Prefix) bool {
+	if len(includes) == 0 {
+		return true
+	}
+	for _, p := range includes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func excludedSource(addr netip.Addr, excludes []netip.Prefix) bool {
+	for _, p := range excludes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }

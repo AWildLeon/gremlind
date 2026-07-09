@@ -62,6 +62,14 @@ decoy_redirect: "/"
 gremlinmusthide: true
 netlink_socket: "/run/gremlind-netlink.sock"
 gre_seq: true
+client:
+  source_fallback: "kernel"
+  source_rules:
+    - family: "ipv6"
+      match_server_subnets: ["2001:db8:feed::/48"]
+      ifaces: ["ppp0", "wan0"]
+      include_subnets: ["2001:db8:1234::/48"]
+      exclude_subnets: ["fe80::/10", "10.0.0.0/8"]
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -81,6 +89,47 @@ gre_seq: true
 	}
 	if !c.GRESeqEnabled() {
 		t.Fatal("gre_seq = false, want true")
+	}
+	if len(c.Client.SourceRules) != 1 {
+		t.Fatalf("source_rules len = %d, want 1", len(c.Client.SourceRules))
+	}
+	if c.Client.SourceFallback != "kernel" {
+		t.Fatalf("source_fallback = %q, want kernel", c.Client.SourceFallback)
+	}
+	if got := c.Client.SourceRules[0].Ifaces; len(got) != 2 || got[0] != "ppp0" || got[1] != "wan0" {
+		t.Fatalf("source rule ifaces = %#v, want ppp0/wan0", got)
+	}
+	if c.Client.SourceRules[0].Family != "ipv6" {
+		t.Fatalf("source rule family = %q, want ipv6", c.Client.SourceRules[0].Family)
+	}
+	if got := c.Client.SourceRules[0].IncludeSubnets; len(got) != 1 || got[0] != "2001:db8:1234::/48" {
+		t.Fatalf("source rule include_subnets = %#v", got)
+	}
+}
+
+func TestInvalidSourceRuleExcludeSubnet(t *testing.T) {
+	c := &Config{
+		Listen: "[::1]:4747",
+		Client: Client{SourceRules: []SourceRule{{ExcludeSubnets: []string{"not-a-cidr"}}}},
+	}
+	c.ApplyDefaults()
+	if err := c.validate(); err == nil {
+		t.Fatal("validate succeeded with invalid source exclude subnet")
+	}
+}
+
+func TestInvalidSourceRuleFamilyAndFallback(t *testing.T) {
+	for name, client := range map[string]Client{
+		"family":   {SourceRules: []SourceRule{{Family: "ipx"}}},
+		"fallback": {SourceFallback: "shrug"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := &Config{Listen: "[::1]:4747", Client: client}
+			c.ApplyDefaults()
+			if err := c.validate(); err == nil {
+				t.Fatal("validate succeeded, want error")
+			}
+		})
 	}
 }
 
