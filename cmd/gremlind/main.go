@@ -474,6 +474,10 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 		_ = prov.Remove(ifName)
 		return sess.ClientInner, true, fmt.Errorf("install mss clamp rules: %w", err)
 	}
+	monitorCtx, stopMSSMonitor := context.WithCancel(ctx)
+	if cfg.MSSClamp.Enabled && cfg.MSSClamp.Monitor {
+		go mssclamp.MonitorLoop(monitorCtx, log, cfg.MSSClamp, ifName, int(sess.MTU))
+	}
 	log.Info("tunnel interface up", "iface", ifName, "addr", sess.ClientInner)
 
 	hookInfo := hooks.Info{
@@ -491,6 +495,7 @@ func dialOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, server,
 	hooks.Run(ctx, log, cfg.Hooks.Up, upInfo)
 
 	defer func() {
+		stopMSSMonitor()
 		if err := mssclamp.Remove(context.Background(), log, cfg.MSSClamp, ifName, int(sess.MTU)); err != nil {
 			log.Warn("mss clamp cleanup failed", "iface", ifName, "err", err)
 		}

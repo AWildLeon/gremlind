@@ -86,6 +86,7 @@ mss_clamp:
   nft_chain: "forward"
   nft_manage_table: true
   iptables_chain: "FORWARD"
+  monitor: false # nftables: event-driven repair after ruleset reloads/flushes
 
 # Optional dialer-side data-plane healthcheck. This probes the negotiated inner
 # peer address through the tunnel interface; after N consecutive failures the

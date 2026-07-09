@@ -73,6 +73,7 @@ mss_clamp:
   nft_family: "inet"
   nft_table: "gremlind"
   nft_chain: "forward"
+  monitor: true
 healthcheck:
   enabled: true
   interval: 10s
@@ -116,7 +117,7 @@ client:
 	if !c.GRESeqEnabled() {
 		t.Fatal("gre_seq = false, want true")
 	}
-	if !c.MSSClamp.Enabled || c.MSSClamp.Backend != "nftables" || c.MSSClamp.Direction != "both" || c.MSSClamp.MSSMode != "tunnel_mtu" || c.MSSClamp.MSS != 1360 || c.MSSClamp.MSS4 != 1360 || c.MSSClamp.MSS6 != 1340 {
+	if !c.MSSClamp.Enabled || c.MSSClamp.Backend != "nftables" || c.MSSClamp.Direction != "both" || c.MSSClamp.MSSMode != "tunnel_mtu" || c.MSSClamp.MSS != 1360 || c.MSSClamp.MSS4 != 1360 || c.MSSClamp.MSS6 != 1340 || !c.MSSClamp.Monitor {
 		t.Fatalf("mss_clamp = %+v", c.MSSClamp)
 	}
 	if !c.HealthCheck.Enabled || c.HealthCheck.Failures != 2 || len(c.HealthCheck.Actions) != 3 || c.HealthCheck.Actions[1] != "run_script" || c.HealthCheck.Script == "" || c.HealthCheck.Target != "fd00:9::1" || c.HealthCheck.PacketSize != 1200 || len(c.HealthCheck.PacketSizes) != 3 || c.HealthCheck.InterPacketDelay.Std() != 250*time.Millisecond || c.HealthCheck.LargePacketDelay.Std() != 2*time.Second || c.HealthCheck.LargePacketThreshold != 1200 || !c.HealthCheck.BindInterface {

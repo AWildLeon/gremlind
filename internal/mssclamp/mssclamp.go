@@ -1,6 +1,7 @@
 package mssclamp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -46,6 +47,76 @@ func Apply(ctx context.Context, log *slog.Logger, cfg config.MSSClamp, iface str
 	}
 	log.Debug("mss clamp rules installed", "backend", cfg.Backend, "iface", iface, "direction", cfg.Direction, "mtu", tunnelMTU)
 	return nil
+}
+
+// MonitorLoop keeps gremlind-owned MSS clamping rules present while a session
+// is active by listening to `nft monitor ruleset` and repairing rules after an
+// nftables reload/flush removes them. This is intentionally event-driven: no
+// periodic polling is performed.
+func MonitorLoop(ctx context.Context, log *slog.Logger, cfg config.MSSClamp, iface string, tunnelMTU int) {
+	if !cfg.Enabled || !cfg.Monitor || cfg.Backend != "nftables" {
+		return
+	}
+	cfg = cfg.WithDefaults()
+	cmd := exec.CommandContext(ctx, "nft", "monitor", "ruleset")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Warn("mss clamp nft monitor setup failed", "iface", iface, "err", err)
+		return
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		log.Warn("mss clamp nft monitor failed to start", "iface", iface, "err", err)
+		return
+	}
+	defer func() { _ = cmd.Wait() }()
+
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return
+		}
+		ok, err := Present(ctx, cfg, iface, tunnelMTU)
+		if err != nil {
+			log.Debug("mss clamp monitor check failed", "iface", iface, "err", err)
+			continue
+		}
+		if ok {
+			continue
+		}
+		log.Warn("mss clamp rules missing after nftables event, reinstalling", "iface", iface)
+		if err := Apply(ctx, log, cfg, iface, tunnelMTU); err != nil {
+			log.Warn("mss clamp monitor repair failed", "iface", iface, "err", err)
+		}
+	}
+	if err := scanner.Err(); err != nil && ctx.Err() == nil {
+		log.Warn("mss clamp nft monitor stopped", "iface", iface, "err", err)
+	}
+}
+
+// Present reports whether all gremlind-owned rules expected for iface exist.
+func Present(ctx context.Context, cfg config.MSSClamp, iface string, tunnelMTU int) (bool, error) {
+	if !cfg.Enabled {
+		return true, nil
+	}
+	cfg = cfg.WithDefaults()
+	for _, spec := range ruleSpecs(cfg.Direction) {
+		var ok bool
+		var err error
+		switch cfg.Backend {
+		case "nftables":
+			ok, err = nftRulesPresent(ctx, cfg, iface, spec)
+		case "iptables":
+			ok, err = iptablesRulesPresent(ctx, cfg, iface, spec, tunnelMTU)
+		default:
+			return false, fmt.Errorf("invalid mss_clamp.backend %q", cfg.Backend)
+		}
+		if err != nil || !ok {
+			return ok, err
+		}
+	}
+	return true, nil
 }
 
 // Remove removes gremlind-owned MSS clamping rules for iface.
@@ -137,6 +208,19 @@ func removeNFT(ctx context.Context, cfg config.MSSClamp, iface string, spec dire
 	return nil
 }
 
+func nftRulesPresent(ctx context.Context, cfg config.MSSClamp, iface string, spec directionSpec) (bool, error) {
+	out, err := output(ctx, "nft", "-a", "list", "chain", cfg.NFTFamily, cfg.NFTTable, cfg.NFTChain)
+	if err != nil {
+		return false, nil
+	}
+	for _, proto := range protocolSpecs() {
+		if !strings.Contains(out, `comment "`+marker(iface, spec.name, proto.name)+`"`) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func ensureNFTTable(ctx context.Context, cfg config.MSSClamp) error {
 	if err := run(ctx, "nft", "list", "table", cfg.NFTFamily, cfg.NFTTable); err == nil {
 		return nil
@@ -185,6 +269,16 @@ func removeIPTables(ctx context.Context, cfg config.MSSClamp, iface string, spec
 		}
 	}
 	return nil
+}
+
+func iptablesRulesPresent(ctx context.Context, cfg config.MSSClamp, iface string, spec directionSpec, tunnelMTU int) (bool, error) {
+	for _, proto := range protocolSpecs() {
+		rule := iptablesRule(cfg, iface, spec, proto, tunnelMTU)
+		if err := run(ctx, proto.iptables, append([]string{"-t", "mangle", "-C", cfg.IPTablesChain}, rule...)...); err != nil {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 type protocolSpec struct {

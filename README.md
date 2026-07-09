@@ -88,7 +88,9 @@ out of strict failure when no rule matches.
 for each tunnel interface. It supports outbound, inbound, or both directions,
 PMTU clamping by default, fixed MSS values via `mss` or per-protocol `mss4` /
 `mss6` overrides, or `mss_mode = "tunnel_mtu"` to derive fixed values from the
-negotiated tunnel MTU (`MTU-40` for IPv4 and `MTU-60` for IPv6).
+negotiated tunnel MTU (`MTU-40` for IPv4 and `MTU-60` for IPv6). With nftables,
+`monitor = true` starts an event-driven `nft monitor ruleset` watcher that repairs
+gremlind-owned rules after ruleset reloads or table flushes.
 
 ### Inside-tunnel healthchecks
 

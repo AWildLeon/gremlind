@@ -43,6 +43,7 @@ type Entry struct {
 	GREKey      uint32     `json:"gre_key"`
 	MTU         int        `json:"mtu"`
 	Since       time.Time  `json:"since"`
+	mssCancel   context.CancelFunc
 }
 
 // Manager provisions sessions and satisfies control.Establisher.
@@ -241,6 +242,11 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 		m.mu.Unlock()
 		return control.SessionGrant{}, control.ResultInternal, err
 	}
+	if m.mssClamp.Enabled && m.mssClamp.Monitor {
+		monitorCtx, cancel := context.WithCancel(ctx)
+		entry.mssCancel = cancel
+		go mssclamp.MonitorLoop(monitorCtx, m.log, m.mssClamp, ifName, mtu)
+	}
 
 	hooks.Run(ctx, m.log, m.upHook, hooks.Info{
 		Event:      "up",
@@ -307,6 +313,9 @@ func (m *Manager) evictLocked(clientID string) *Entry {
 
 // removeAndNotify deletes the interface and runs the down hook for an entry.
 func (m *Manager) removeAndNotify(entry *Entry) {
+	if entry.mssCancel != nil {
+		entry.mssCancel()
+	}
 	if err := mssclamp.Remove(context.Background(), m.log, m.mssClamp, entry.IfName, entry.MTU); err != nil {
 		m.log.Warn("mss clamp cleanup failed", "iface", entry.IfName, "err", err)
 	}

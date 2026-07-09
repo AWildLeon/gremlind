@@ -222,6 +222,7 @@ type MSSClamp struct {
 	NFTChain       string `yaml:"nft_chain"`
 	NFTManageTable bool   `yaml:"nft_manage_table"`
 	IPTablesChain  string `yaml:"iptables_chain"`
+	Monitor        bool   `yaml:"monitor"` // nftables: watch ruleset changes and repair missing rules
 }
 
 func (m MSSClamp) WithDefaults() MSSClamp {
