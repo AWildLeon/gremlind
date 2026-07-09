@@ -55,6 +55,36 @@
         let
           settingsFormat = pkgs.formats.yaml { };
 
+          sourceRuleModule = { ... }: {
+            options = {
+              ifaces = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = "Only use source addresses configured on these interfaces; empty means all up interfaces.";
+              };
+              family = lib.mkOption {
+                type = lib.types.enum [ "any" "ipv4" "ipv6" ];
+                default = "any";
+                description = "Restrict selected source address family.";
+              };
+              match_server_subnets = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = "Only apply this rule when the server resolves inside one of these prefixes.";
+              };
+              include_subnets = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = "Only allow local source addresses inside these prefixes.";
+              };
+              exclude_subnets = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                description = "Deny local source addresses inside these prefixes.";
+              };
+            };
+          };
+
           instanceModule = { name, config, ... }: {
             options = {
               enable = lib.mkEnableOption "this gremlind instance" // { default = true; };
@@ -138,6 +168,21 @@
                     runs more than one connect instance at once, since two
                     instances defaulting to the same name would collide.
                   '';
+                };
+                sourceRules = lib.mkOption {
+                  type = lib.types.listOf (lib.types.submodule sourceRuleModule);
+                  default = [ ];
+                  description = ''
+                    Ordered source-address selection rules for connect role.
+                    Rendered as client.source_rules so they can be combined with
+                    secret-backed client.id/secret/iface without duplicate YAML
+                    client blocks.
+                  '';
+                };
+                sourceFallback = lib.mkOption {
+                  type = lib.types.enum [ "fail" "kernel" ];
+                  default = "fail";
+                  description = "What to do if sourceRules are configured but no local address matches.";
                 };
               };
               useNetlinkd = lib.mkOption {
@@ -248,7 +293,7 @@
                         printf '    ${id}: "%s"\n' "$(cat "$CREDENTIALS_DIRECTORY/client-${id}")" >> "$out"
                       '') (lib.attrNames cfg.auth.clients)}
                     ''}
-                    ${lib.optionalString (cfg.client.id != null || cfg.client.secretFile != null || cfg.client.iface != null) ''
+                    ${lib.optionalString (cfg.client.id != null || cfg.client.secretFile != null || cfg.client.iface != null || cfg.client.sourceRules != [ ] || cfg.client.sourceFallback != "fail") ''
                       echo 'client:' >> "$out"
                     ''}
                     ${lib.optionalString (cfg.client.id != null) ''
@@ -259,6 +304,31 @@
                     ''}
                     ${lib.optionalString (cfg.client.iface != null) ''
                       printf '  iface: "%s"\n' ${lib.escapeShellArg cfg.client.iface} >> "$out"
+                    ''}
+                    ${lib.optionalString (cfg.client.sourceFallback != "fail") ''
+                      printf '  source_fallback: "%s"\n' ${lib.escapeShellArg cfg.client.sourceFallback} >> "$out"
+                    ''}
+                    ${lib.optionalString (cfg.client.sourceRules != [ ]) ''
+                      echo '  source_rules:' >> "$out"
+                      ${lib.concatMapStringsSep "\n" (rule: ''
+                        echo '    - family: "${rule.family}"' >> "$out"
+                        ${lib.optionalString (rule.ifaces != [ ]) ''
+                          echo '      ifaces:' >> "$out"
+                          ${lib.concatMapStringsSep "\n" (v: ''printf '        - "%s"\n' ${lib.escapeShellArg v} >> "$out"'') rule.ifaces}
+                        ''}
+                        ${lib.optionalString (rule.match_server_subnets != [ ]) ''
+                          echo '      match_server_subnets:' >> "$out"
+                          ${lib.concatMapStringsSep "\n" (v: ''printf '        - "%s"\n' ${lib.escapeShellArg v} >> "$out"'') rule.match_server_subnets}
+                        ''}
+                        ${lib.optionalString (rule.include_subnets != [ ]) ''
+                          echo '      include_subnets:' >> "$out"
+                          ${lib.concatMapStringsSep "\n" (v: ''printf '        - "%s"\n' ${lib.escapeShellArg v} >> "$out"'') rule.include_subnets}
+                        ''}
+                        ${lib.optionalString (rule.exclude_subnets != [ ]) ''
+                          echo '      exclude_subnets:' >> "$out"
+                          ${lib.concatMapStringsSep "\n" (v: ''printf '        - "%s"\n' ${lib.escapeShellArg v} >> "$out"'') rule.exclude_subnets}
+                        ''}
+                      '') cfg.client.sourceRules}
                     ''}
                   '';
                 in
