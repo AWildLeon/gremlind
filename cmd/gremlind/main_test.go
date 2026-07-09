@@ -2,6 +2,7 @@ package main
 
 import (
 	"net"
+	"net/netip"
 	"testing"
 
 	"gremlind/internal/config"
@@ -36,6 +37,19 @@ func TestSecretFromInputsCanDisableEnvLookup(t *testing.T) {
 
 	if got := secretFromInputs("", "", cfg); got != "from-config" {
 		t.Fatalf("secret = %q, want from-config", got)
+	}
+}
+
+func TestSourceRuleSkipsExcludedServerAddresses(t *testing.T) {
+	addr, err := chooseSourceAddressFromRule(nil, []netip.Addr{netip.MustParseAddr("2a14:47c0:e000::1")}, config.SourceRule{
+		Family:         "ipv6",
+		ExcludeSubnets: []string{"2a14:47c0:e000::/40"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr.IsValid() {
+		t.Fatalf("source rule selected %s for excluded server address", addr)
 	}
 }
 

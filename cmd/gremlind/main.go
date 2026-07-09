@@ -704,9 +704,13 @@ func sourceRuleFamilies(serverAddrs []netip.Addr, rule config.SourceRule) (map[b
 	if err != nil {
 		return nil, false, err
 	}
+	excludes, err := parsePrefixes("exclude_subnets", rule.ExcludeSubnets)
+	if err != nil {
+		return nil, false, err
+	}
 	families := map[bool]bool{}
 	for _, addr := range serverAddrs {
-		if !includedSource(addr, serverMatches) {
+		if !includedSource(addr, serverMatches) || excludedSource(addr, excludes) {
 			continue
 		}
 		families[addr.Is6()] = true

@@ -313,7 +313,8 @@ type SourceRule struct {
 	MatchServerSubnets []string `yaml:"match_server_subnets"`
 	// IncludeSubnets, when non-empty, only allows candidates inside these CIDRs.
 	IncludeSubnets []string `yaml:"include_subnets"`
-	// ExcludeSubnets removes candidates contained in any listed CIDR prefix.
+	// ExcludeSubnets removes local candidates contained in any listed CIDR prefix;
+	// if the server resolves into one of these prefixes, this rule is skipped too.
 	ExcludeSubnets []string `yaml:"exclude_subnets"`
 }
 

@@ -77,8 +77,8 @@ commented configuration.
 `client.source_rules` can constrain the local address used by `gremlind connect`.
 Rules are tried in order; each rule may match server prefixes, restrict address
 family, restrict candidate addresses to specific `ifaces`, require candidates to
-be in `include_subnets`, and remove unwanted ranges with `exclude_subnets`. The
-selected address is bound on the TCP control connection and becomes the GRE outer
+be in `include_subnets`, and remove unwanted local/server ranges with
+`exclude_subnets`. The selected address is bound on the TCP control connection and becomes the GRE outer
 address advertised to the server. `client.source_fallback = "kernel"` can opt
 out of strict failure when no rule matches.
 
