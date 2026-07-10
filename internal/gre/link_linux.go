@@ -149,6 +149,40 @@ func RemovePrefix(prefix string) ([]string, error) {
 	return removed, nil
 }
 
+// isGREKind reports whether an rtnetlink IFLA_INFO_KIND names a GRE tunnel, the
+// only link type gremlind ever creates (see createGRE).
+func isGREKind(kind string) bool { return kind == "gre" || kind == "ip6gre" }
+
+// RemoveNamedGRE deletes any leftover interface whose name is in names, but only
+// when that interface is actually a GRE tunnel. Operator-pinned names (unlike
+// the reserved "grem" prefix) can coincide with unrelated system interfaces, so
+// the kind check ensures netlinkd startup cleanup never tears down a same-named
+// non-GRE device such as a real wg0 or eth0.
+func RemoveNamedGRE(names []string) ([]string, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	want := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		want[n] = struct{}{}
+	}
+	links, err := dumpLinks()
+	if err != nil {
+		return nil, err
+	}
+	var removed []string
+	for _, li := range links {
+		if _, ok := want[li.name]; !ok || !isGREKind(li.kind) {
+			continue
+		}
+		if err := linkDel(li.index); err != nil {
+			return removed, fmt.Errorf("gre: delete %s: %w", li.name, err)
+		}
+		removed = append(removed, li.name)
+	}
+	return removed, nil
+}
+
 // OuterMTU returns the MTU of the interface that owns the local outer address,
 // letting the server contribute its real link MTU to negotiation.
 func OuterMTU(local netip.Addr) (int, error) {

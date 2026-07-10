@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"gremlind/internal/control"
+	"gremlind/internal/gre"
 
 	"gopkg.in/yaml.v3"
 )
@@ -100,6 +101,15 @@ type Config struct {
 
 	Auth  Auth  `yaml:"auth"`
 	Hooks Hooks `yaml:"hooks"`
+
+	// Interfaces optionally pins a fixed data-plane interface name for specific
+	// clients, keyed by client ID. Clients without an entry keep the default
+	// per-session "grem"+key naming. Each name must be a valid interface name
+	// (<= 15 chars, [A-Za-z0-9_-], first char alphanumeric), must not collide
+	// with the auto-generated "grem"+key namespace, and unique across clients.
+	// When the netlink broker is used, the same names must be passed to
+	// netlinkd via -iface so the broker will provision them.
+	Interfaces map[string]string `yaml:"interfaces"`
 
 	// Client holds dialer-role settings (used by `gremlind connect`).
 	Client Client `yaml:"client"`
@@ -255,6 +265,22 @@ func (c *Config) ValidateServer() error {
 		if len(secret) < MinSecretLen {
 			return fmt.Errorf("auth: secret for client %q must be at least %d bytes", id, MinSecretLen)
 		}
+	}
+	seen := make(map[string]string, len(c.Interfaces))
+	for id, name := range c.Interfaces {
+		if !control.ValidClientID(id) {
+			return fmt.Errorf("interfaces: invalid client id %q (allowed: A-Z a-z 0-9 . _ -, length 1..64)", id)
+		}
+		if !gre.ValidName(name) {
+			return fmt.Errorf("interfaces: invalid name %q for client %q (allowed: A-Z a-z 0-9 _ -, first char alphanumeric, length 1..%d)", name, id, gre.MaxNameLen)
+		}
+		if gre.IsGeneratedName(name) {
+			return fmt.Errorf("interfaces: name %q for client %q collides with the auto-generated \"grem\"+key namespace", name, id)
+		}
+		if other, dup := seen[name]; dup {
+			return fmt.Errorf("interfaces: name %q assigned to both %q and %q", name, other, id)
+		}
+		seen[name] = id
 	}
 	return nil
 }

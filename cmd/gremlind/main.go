@@ -67,7 +67,7 @@ func usage() {
 usage:
   gremlind server   [-c config.yaml] [-v]
   gremlind connect  <server:port> [-c config.yaml] [-id ID] [-secret S] [-secret-env ENV] [-v]
-  gremlind netlinkd -s /run/gremlind-netlink.sock [-mode 0600] [-group GROUP] [-gre-local ADDR] [-v]
+  gremlind netlinkd -s /run/gremlind-netlink.sock [-mode 0600] [-group GROUP] [-gre-local ADDR] [-iface NAME]... [-v]
   gremlind status   [-s /run/gremlind.sock]
 `)
 }
@@ -125,6 +125,7 @@ func runServer(args []string) error {
 		UpHook:      cfg.Hooks.Up,
 		DownHook:    cfg.Hooks.Down,
 		LeaseTTL:    cfg.LeaseTTL.Std(),
+		Interfaces:  cfg.Interfaces,
 	}
 	var mgr *session.Manager
 	if cfg.NetlinkSocket != "" {
@@ -187,12 +188,23 @@ type greProvisioner struct{}
 func (greProvisioner) Ensure(p gre.Params) error { return gre.Ensure(p) }
 func (greProvisioner) Remove(name string) error  { return gre.Remove(name) }
 
+// stringList collects a repeatable string flag (e.g. -iface a -iface b).
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+func (l *stringList) Set(v string) error {
+	*l = append(*l, v)
+	return nil
+}
+
 func runNetlinkd(args []string) error {
 	fs := flag.NewFlagSet("netlinkd", flag.ContinueOnError)
 	sock := fs.String("s", "", "unix socket path for provisioning RPC")
 	modeFlag := fs.String("mode", "0600", "provisioning socket mode (octal, e.g. 0600 or 0660)")
 	group := fs.String("group", "", "optional provisioning socket group")
 	greLocalFlag := fs.String("gre-local", "", "optional allowed GRE local outer address")
+	var ifaces stringList
+	fs.Var(&ifaces, "iface", "operator-pinned interface name to allow, in addition to the grem namespace (repeatable)")
 	verbose := fs.Bool("v", false, "verbose (debug) logging")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -219,16 +231,24 @@ func runNetlinkd(args []string) error {
 	} else if len(removed) > 0 {
 		log.Info("removed stale gremlind interfaces", "ifaces", removed)
 	}
+	// Pinned custom names live outside the grem prefix, so sweep them too — but
+	// only if they are GRE tunnels, never a same-named unrelated device.
+	if removed, err := gre.RemoveNamedGRE(ifaces); err != nil {
+		return fmt.Errorf("netlinkd: cleanup stale pinned interfaces: %w", err)
+	} else if len(removed) > 0 {
+		log.Info("removed stale pinned gremlind interfaces", "ifaces", removed)
+	}
 	ctx, stop := signalContext()
 	defer stop()
 	return (&provisionrpc.Server{
-		Log:      log,
-		Path:     *sock,
-		Mode:     mode,
-		Group:    *group,
-		GRELocal: greLocal,
-		Prov:     greProvisioner{},
-		OuterMTU: gre.OuterMTU,
+		Log:        log,
+		Path:       *sock,
+		Mode:       mode,
+		Group:      *group,
+		GRELocal:   greLocal,
+		Prov:       greProvisioner{},
+		OuterMTU:   gre.OuterMTU,
+		AllowNames: ifaces,
 	}).Serve(ctx)
 }
 

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,6 +41,37 @@ func newTestManager(t *testing.T, outerMTU, cap int, prov Provisioner) (*Manager
 		UseGREKey:   true,
 	}, prov)
 	return m, pool
+}
+
+func TestEstablishUsesPinnedInterfaceNamePerClient(t *testing.T) {
+	prov := &fakeProv{}
+	m, _ := newTestManager(t, 1500, 0, prov)
+	m.ifNames = map[string]string{"site-a": "gremlin-a"}
+
+	// Pinned client gets its fixed name.
+	if _, res, err := m.Establish(context.Background(), control.SessionParams{
+		ClientID:    "site-a",
+		ClientOuter: netip.MustParseAddr("2001:db8::20"),
+		OuterMTU:    1500,
+	}); err != nil || res != control.ResultOK {
+		t.Fatalf("establish site-a: res=%s err=%v", res, err)
+	}
+	if len(prov.ensured) != 1 || prov.ensured[0].Name != "gremlin-a" {
+		t.Fatalf("expected Ensure for gremlin-a, got %+v", prov.ensured)
+	}
+
+	// Unpinned client keeps the default grem+key naming.
+	if _, res, err := m.Establish(context.Background(), control.SessionParams{
+		ClientID:    "site-b",
+		ClientOuter: netip.MustParseAddr("2001:db8::21"),
+		OuterMTU:    1500,
+	}); err != nil || res != control.ResultOK {
+		t.Fatalf("establish site-b: res=%s err=%v", res, err)
+	}
+	nameB := prov.ensured[1].Name
+	if !strings.HasPrefix(nameB, "grem") || nameB == "gremlin-a" {
+		t.Errorf("site-b iface = %q, want default grem-prefixed name", nameB)
+	}
 }
 
 func TestEstablishNegotiatesMTUAndProvisions(t *testing.T) {

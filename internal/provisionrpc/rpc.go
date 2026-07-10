@@ -96,9 +96,14 @@ type Server struct {
 	GRELocal netip.Addr // optional allow-list for tunnel outer local address
 	Prov     Provisioner
 	OuterMTU func(netip.Addr) (int, error)
+	// AllowNames is an optional allow-list of operator-pinned interface names
+	// (from config `interfaces`) that the broker will provision in addition to
+	// the built-in "grem"+key namespace. Names outside both sets are rejected.
+	AllowNames []string
 
-	mu      sync.Mutex
-	created map[string]struct{} // interfaces created by this broker instance
+	mu       sync.Mutex
+	created  map[string]struct{} // interfaces created by this broker instance
+	allowSet map[string]struct{} // AllowNames as a lookup set, built in Serve
 }
 
 func (s *Server) Serve(ctx context.Context) error {
@@ -114,9 +119,18 @@ func (s *Server) Serve(ctx context.Context) error {
 	if s.OuterMTU == nil {
 		s.OuterMTU = gre.OuterMTU
 	}
+	for _, name := range s.AllowNames {
+		if !gre.ValidName(name) {
+			return fmt.Errorf("provisionrpc: invalid allowed interface name %q", name)
+		}
+	}
 	s.mu.Lock()
 	if s.created == nil {
 		s.created = make(map[string]struct{})
+	}
+	s.allowSet = make(map[string]struct{}, len(s.AllowNames))
+	for _, name := range s.AllowNames {
+		s.allowSet[name] = struct{}{}
 	}
 	s.mu.Unlock()
 	if err := removeStaleSocket(s.Path); err != nil {
@@ -205,7 +219,7 @@ func (s *Server) handle(conn net.Conn) {
 			s.markCreated(req.Params.Name)
 		}
 	case "remove":
-		if err := validateName(req.Name); err != nil {
+		if err := s.validateName(req.Name); err != nil {
 			resp.Error = err.Error()
 		} else if !s.wasCreated(req.Name) {
 			resp.Error = "refusing to remove interface not created by this broker"
@@ -256,7 +270,7 @@ func (s *Server) markRemoved(name string) {
 }
 
 func (s *Server) validateParams(p gre.Params) error {
-	if err := validateName(p.Name); err != nil {
+	if err := s.validateName(p.Name); err != nil {
 		return err
 	}
 	if !p.Local.IsValid() || !p.Remote.IsValid() || p.Local.Is6() != p.Remote.Is6() {
@@ -286,10 +300,23 @@ func (s *Server) validateParams(p gre.Params) error {
 	return nil
 }
 
-func validateName(name string) error {
-	// Server-side generated names are "grem" (plain GRE) or "grem" + hex key;
-	// the dialer uses "grem0". Accept only that tight namespace, never generic
-	// interface names or shell metacharacters.
+func (s *Server) validateName(name string) error {
+	if err := validateGremName(name); err == nil {
+		return nil
+	}
+	// Fall back to the operator-configured allow-list of pinned names. These are
+	// re-checked against the safe charset as defence-in-depth even though they
+	// were validated when the broker started.
+	if _, ok := s.allowSet[name]; ok && gre.ValidName(name) {
+		return nil
+	}
+	return fmt.Errorf("invalid interface name")
+}
+
+// validateGremName accepts only the built-in "grem" namespace: "grem" (plain
+// GRE), "grem0" (dialer), or "grem" + hex key. This is the tight default set,
+// free of generic interface names and shell metacharacters.
+func validateGremName(name string) error {
 	if name == "grem" || name == "grem0" {
 		return nil
 	}

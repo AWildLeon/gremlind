@@ -69,3 +69,13 @@ auth:
 hooks:
   up: ""
   down: ""
+
+# Optional fixed data-plane interface names for specific clients, keyed by
+# client ID. Clients without an entry keep the default per-session "grem"+key
+# naming. Names must be <= 15 chars, use only [A-Za-z0-9_-] with an
+# alphanumeric first char, be unique, and not collide with the auto-generated
+# "grem"+key names (e.g. "grem", "grem0", "grem1a2b").
+# When netlink_socket is set, pass the same names to netlinkd via -iface.
+# interfaces:
+#   site-a: "gremlin-a"
+#   site-b: "gremlin-b"

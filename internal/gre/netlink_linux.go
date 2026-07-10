@@ -161,6 +161,7 @@ func parseAttrs(b []byte) []nlattr {
 type linkInfo struct {
 	index int32
 	name  string
+	kind  string // rtnetlink IFLA_INFO_KIND, e.g. "gre" or "ip6gre"
 }
 
 func dumpLinks() ([]linkInfo, error) {
@@ -177,9 +178,15 @@ func dumpLinks() ([]linkInfo, error) {
 		}
 		li := linkInfo{index: int32(native.Uint32(p[4:]))}
 		for _, a := range parseAttrs(p[unix.SizeofIfInfomsg:]) {
-			if a.typ == unix.IFLA_IFNAME {
+			switch a.typ {
+			case unix.IFLA_IFNAME:
 				li.name = trimNul(a.data)
-				break
+			case unix.IFLA_LINKINFO:
+				for _, nested := range parseAttrs(a.data) {
+					if nested.typ == unix.IFLA_INFO_KIND {
+						li.kind = trimNul(nested.data)
+					}
+				}
 			}
 		}
 		if li.name != "" {

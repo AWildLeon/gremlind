@@ -57,6 +57,7 @@ type Manager struct {
 	upHook      string
 	downHook    string
 	leaseTTL    time.Duration
+	ifNames     map[string]string // client ID -> pinned interface name (optional)
 
 	mu         sync.Mutex
 	sessions   map[uint32]*Entry     // active sessions keyed by GRE key
@@ -78,6 +79,9 @@ type Config struct {
 	UpHook      string        // script run when a session interface comes up
 	DownHook    string        // script run when a session interface goes down
 	LeaseTTL    time.Duration // sticky lease lifetime after last use; 0 disables expiry
+	// Interfaces optionally pins a fixed interface name per client ID; clients
+	// without an entry keep the default per-session "grem"+key naming.
+	Interfaces map[string]string
 }
 
 // New builds a Manager using the real netlink data-plane.
@@ -114,6 +118,7 @@ func newWith(cfg Config, prov Provisioner) *Manager {
 		upHook:      cfg.UpHook,
 		downHook:    cfg.DownHook,
 		leaseTTL:    cfg.LeaseTTL,
+		ifNames:     cfg.Interfaces,
 		sessions:    make(map[uint32]*Entry),
 		active:      make(map[string]uint32),
 		leases:      make(map[string]netip.Addr),
@@ -161,7 +166,7 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 	if m.useGRESeq {
 		tunnelFlags |= control.TunnelFlagGRESeq
 	}
-	ifName := m.ifName(sessionKey)
+	ifName := m.ifNameFor(p.ClientID, sessionKey)
 	entry := &Entry{
 		ClientID:    p.ClientID,
 		IfName:      ifName,
@@ -363,6 +368,16 @@ func (m *Manager) leaseAvailableToLocked(clientID string, addr netip.Addr) bool 
 		}
 	}
 	return true
+}
+
+// ifNameFor returns the data-plane interface name for a session. Clients with a
+// pinned name in the config get that fixed name; everyone else gets the default
+// unpredictable per-session "grem"+key naming.
+func (m *Manager) ifNameFor(clientID string, key uint32) string {
+	if name, ok := m.ifNames[clientID]; ok {
+		return name
+	}
+	return m.ifName(key)
 }
 
 func (m *Manager) ifName(key uint32) string {

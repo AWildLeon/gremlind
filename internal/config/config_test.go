@@ -102,3 +102,45 @@ func TestApplyDefaultsIdempotent(t *testing.T) {
 		t.Errorf("keepalive_timeout overwritten: %s", c.KeepaliveTimeout.Std())
 	}
 }
+
+// validServerConfig returns a minimal Config that passes ValidateServer, so
+// tests can toggle a single field and assert its validation in isolation.
+func validServerConfig() *Config {
+	c := &Config{
+		GRELocal:    "2001:db8::10",
+		InnerPool:   "fd00:9::/112",
+		ServerInner: "fd00:9::1",
+		Auth:        Auth{PSK: "0123456789abcdef0123456789abcdef"},
+	}
+	c.ApplyDefaults()
+	return c
+}
+
+func TestValidateServerInterfaces(t *testing.T) {
+	tests := []struct {
+		name       string
+		interfaces map[string]string
+		wantErr    bool
+	}{
+		{"valid", map[string]string{"site-a": "gremlin-a", "site-b": "wg0"}, false},
+		{"empty ok", nil, false},
+		{"bad client id", map[string]string{"bad id": "gremlin-a"}, true},
+		{"too long", map[string]string{"site-a": "abcdefghijklmnop"}, true},
+		{"bad charset", map[string]string{"site-a": "gremlin/a"}, true},
+		{"leading dash", map[string]string{"site-a": "-eth"}, true},
+		{"grem-dash ok", map[string]string{"site-a": "grem-a"}, false},
+		{"collides with generated namespace", map[string]string{"site-a": "grem1234"}, true},
+		{"reserved grem literal", map[string]string{"site-a": "grem"}, true},
+		{"duplicate name", map[string]string{"site-a": "dup", "site-b": "dup"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := validServerConfig()
+			c.Interfaces = tt.interfaces
+			err := c.ValidateServer()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateServer() err = %v, wantErr = %v", err, tt.wantErr)
+			}
+		})
+	}
+}

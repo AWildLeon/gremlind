@@ -54,6 +54,20 @@
       nixosModules.gremlind = { config, lib, pkgs, ... }:
         let
           cfg = config.services.gremlind;
+          # Per-client pinned interface names are merged into the server config at
+          # runtime (not build time) so a secret-bearing configFile never has to be
+          # copied into the world-readable Nix store.
+          useIfaceMerge = cfg.role == "server" && cfg.interfaces != { };
+          ifaceFragment = (pkgs.formats.yaml { }).generate "gremlind-interfaces.yaml" {
+            interfaces = cfg.interfaces;
+          };
+          mergeConfigScript = pkgs.writeShellScript "gremlind-merge-config" ''
+            set -euo pipefail
+            umask 0077
+            ${pkgs.yq-go}/bin/yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' \
+              ${cfg.configFile} ${ifaceFragment} > "$RUNTIME_DIRECTORY/config.yaml"
+          '';
+          effectiveConfig = if useIfaceMerge then "/run/gremlind/config.yaml" else "${cfg.configFile}";
         in
         {
           options.services.gremlind = {
@@ -76,6 +90,22 @@
               type = lib.types.nullOr lib.types.str;
               default = null;
               description = "Server address:port when role = connect.";
+            };
+            interfaces = lib.mkOption {
+              type = lib.types.attrsOf lib.types.str;
+              default = { };
+              example = { site-a = "gremlin-a"; site-b = "gremlin-b"; };
+              description = ''
+                Fixed data-plane interface names for specific clients, keyed by
+                client ID (server role only). Clients without an entry keep the
+                default per-session "grem"+key naming. Names must be <= 15 chars,
+                use only [A-Za-z0-9_-] with an alphanumeric first char, be unique,
+                and not collide with the auto-generated "grem"+key names.
+
+                These are merged into the server config at service start, and, when
+                netlinkd.enable is set, passed to the broker via -iface so it will
+                provision them.
+              '';
             };
             netlinkd = {
               enable = lib.mkEnableOption "separate privileged gremlind netlink broker";
@@ -106,9 +136,12 @@
               after = [ "network-online.target" ] ++ lib.optional cfg.netlinkd.enable "gremlind-netlinkd.service";
               wants = [ "network-online.target" ] ++ lib.optional cfg.netlinkd.enable "gremlind-netlinkd.service";
               serviceConfig = {
+                ExecStartPre = lib.optional useIfaceMerge "${mergeConfigScript}";
+                RuntimeDirectory = lib.mkIf useIfaceMerge "gremlind";
+                RuntimeDirectoryMode = lib.mkIf useIfaceMerge "0700";
                 ExecStart =
                   if cfg.role == "server" then
-                    "${lib.getExe cfg.package} server -c ${cfg.configFile}"
+                    "${lib.getExe cfg.package} server -c ${effectiveConfig}"
                   else
                     "${lib.getExe cfg.package} connect ${cfg.connectTo} -c ${cfg.configFile}";
                 Restart = "on-failure";
@@ -144,7 +177,8 @@
               wants = [ "network-online.target" ];
               serviceConfig = {
                 ExecStart = "${lib.getExe cfg.package} netlinkd -s ${cfg.netlinkd.socket} -mode 0660 -group ${cfg.netlinkd.group}"
-                  + lib.optionalString (cfg.netlinkd.greLocal != null) " -gre-local ${cfg.netlinkd.greLocal}";
+                  + lib.optionalString (cfg.netlinkd.greLocal != null) " -gre-local ${cfg.netlinkd.greLocal}"
+                  + lib.concatMapStrings (n: " -iface ${n}") (lib.attrValues cfg.interfaces);
                 Restart = "on-failure";
                 RestartSec = 3;
                 UMask = "0077";
