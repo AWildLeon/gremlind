@@ -13,10 +13,12 @@ import (
 	"sync"
 	"time"
 
+	"gremlind/internal/config"
 	"gremlind/internal/control"
 	"gremlind/internal/gre"
 	"gremlind/internal/hooks"
 	"gremlind/internal/ippool"
+	"gremlind/internal/mssclamp"
 )
 
 // Provisioner abstracts the data-plane so the manager is unit-testable without
@@ -41,6 +43,7 @@ type Entry struct {
 	GREKey      uint32     `json:"gre_key"`
 	MTU         int        `json:"mtu"`
 	Since       time.Time  `json:"since"`
+	mssCancel   context.CancelFunc
 }
 
 // Manager provisions sessions and satisfies control.Establisher.
@@ -58,6 +61,8 @@ type Manager struct {
 	downHook    string
 	leaseTTL    time.Duration
 	ifNames     map[string]string // client ID -> pinned interface name (optional)
+	fouPort     uint16
+	mssClamp    config.MSSClamp
 
 	mu         sync.Mutex
 	sessions   map[uint32]*Entry     // active sessions keyed by GRE key
@@ -82,6 +87,8 @@ type Config struct {
 	// Interfaces optionally pins a fixed interface name per client ID; clients
 	// without an entry keep the default per-session "grem"+key naming.
 	Interfaces map[string]string
+	FOUPort    uint16 // wrap tunnels in Foo-over-UDP on this port; 0 = plain GRE
+	MSSClamp   config.MSSClamp
 }
 
 // New builds a Manager using the real netlink data-plane.
@@ -96,6 +103,10 @@ func NewWithProvisioner(cfg Config, prov Provisioner) *Manager {
 }
 
 func newWith(cfg Config, prov Provisioner) *Manager {
+	if cfg.FOUPort != 0 {
+		cfg.UseGREKey = false
+		cfg.UseGRESeq = false
+	}
 	outer := cfg.OuterMTU
 	if outer == 0 {
 		if m, err := gre.OuterMTU(cfg.GRELocal); err == nil {
@@ -119,6 +130,8 @@ func newWith(cfg Config, prov Provisioner) *Manager {
 		downHook:    cfg.DownHook,
 		leaseTTL:    cfg.LeaseTTL,
 		ifNames:     cfg.Interfaces,
+		fouPort:     cfg.FOUPort,
+		mssClamp:    cfg.MSSClamp,
 		sessions:    make(map[uint32]*Entry),
 		active:      make(map[string]uint32),
 		leases:      make(map[string]netip.Addr),
@@ -136,7 +149,11 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 			fmt.Errorf("outer family mismatch: client %s vs server %s", p.ClientOuter, m.greLocal)
 	}
 
-	mtu := m.negotiateMTU(int(p.OuterMTU))
+	serverOuterMTU := m.outerMTU
+	if pathMTU, err := gre.OuterMTUForPath(m.greLocal, p.ClientOuter); err == nil {
+		serverOuterMTU = pathMTU
+	}
+	mtu := m.negotiateMTUWithServerOuter(serverOuterMTU, int(p.OuterMTU))
 
 	// Under the lock: evict any stale session for the same client (roaming —
 	// the client reconnected, likely from a new outer IP), then assign the inner
@@ -199,6 +216,8 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 		InnerLocal: m.serverInner,
 		InnerPeer:  clientInner,
 		LinkLocal:  gre.ServerLinkLocal,
+		FOUSport:   m.fouPort,
+		FOUDport:   m.fouPort,
 	}); err != nil {
 		m.mu.Lock()
 		if m.sessions[sessionKey] == entry {
@@ -212,6 +231,26 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 		}
 		m.mu.Unlock()
 		return control.SessionGrant{}, control.ResultInternal, err
+	}
+	if err := mssclamp.Apply(ctx, m.log, m.mssClamp, ifName, mtu); err != nil {
+		_ = m.prov.Remove(ifName)
+		m.mu.Lock()
+		if m.sessions[sessionKey] == entry {
+			delete(m.sessions, sessionKey)
+			if m.active[p.ClientID] == sessionKey {
+				delete(m.active, p.ClientID)
+			}
+			m.pool.Release(clientInner)
+			delete(m.leases, p.ClientID)
+			delete(m.leaseTimes, p.ClientID)
+		}
+		m.mu.Unlock()
+		return control.SessionGrant{}, control.ResultInternal, err
+	}
+	if m.mssClamp.Enabled && m.mssClamp.Monitor {
+		monitorCtx, cancel := context.WithCancel(ctx)
+		entry.mssCancel = cancel
+		go mssclamp.MonitorLoop(monitorCtx, m.log, m.mssClamp, ifName, mtu)
 	}
 
 	hooks.Run(ctx, m.log, m.upHook, hooks.Info{
@@ -279,6 +318,12 @@ func (m *Manager) evictLocked(clientID string) *Entry {
 
 // removeAndNotify deletes the interface and runs the down hook for an entry.
 func (m *Manager) removeAndNotify(entry *Entry) {
+	if entry.mssCancel != nil {
+		entry.mssCancel()
+	}
+	if err := mssclamp.Remove(context.Background(), m.log, m.mssClamp, entry.IfName, entry.MTU); err != nil {
+		m.log.Warn("mss clamp cleanup failed", "iface", entry.IfName, "err", err)
+	}
 	if err := m.prov.Remove(entry.IfName); err != nil {
 		m.log.Warn("interface removal failed", "iface", entry.IfName, "err", err)
 	}
@@ -300,11 +345,18 @@ func (m *Manager) removeAndNotify(entry *Entry) {
 // non-positive or wrapped value even if an authenticated peer reports a bogus
 // tiny outer MTU.
 func (m *Manager) negotiateMTU(clientOuterMTU int) int {
-	outer := m.outerMTU
+	return m.negotiateMTUWithServerOuter(m.outerMTU, clientOuterMTU)
+}
+
+func (m *Manager) negotiateMTUWithServerOuter(serverOuterMTU, clientOuterMTU int) int {
+	outer := serverOuterMTU
+	if outer <= 0 {
+		outer = m.outerMTU
+	}
 	if clientOuterMTU > 0 && clientOuterMTU < outer {
 		outer = clientOuterMTU
 	}
-	mtu := outer - gre.OverheadWithOptions(m.greLocal, m.useGREKey, m.useGRESeq)
+	mtu := outer - gre.OverheadWithFOU(m.greLocal, m.useGREKey, m.useGRESeq, m.fouPort != 0)
 	if m.mtuCap > 0 && m.mtuCap < mtu {
 		mtu = m.mtuCap
 	}

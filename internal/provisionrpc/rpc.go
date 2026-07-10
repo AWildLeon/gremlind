@@ -34,6 +34,7 @@ type request struct {
 	Params gre.Params `json:"params,omitempty"`
 	Name   string     `json:"name,omitempty"`
 	Local  netip.Addr `json:"local,omitempty"`
+	Remote netip.Addr `json:"remote,omitempty"`
 }
 
 type response struct {
@@ -65,6 +66,14 @@ func (c Client) OuterMTU(local netip.Addr) (int, error) {
 	return resp.MTU, nil
 }
 
+func (c Client) OuterMTUForPath(local, remote netip.Addr) (int, error) {
+	resp, err := c.call(request{Op: "outer_mtu", Local: local, Remote: remote})
+	if err != nil {
+		return 0, err
+	}
+	return resp.MTU, nil
+}
+
 func (c Client) call(req request) (response, error) {
 	var zero response
 	conn, err := net.DialTimeout("unix", c.Path, defaultTimeout)
@@ -89,13 +98,14 @@ func (c Client) call(req request) (response, error) {
 // Server is the privileged, local-only broker. It deliberately accepts only a
 // tiny semantic API rather than arbitrary rtnetlink messages.
 type Server struct {
-	Log      *slog.Logger
-	Path     string
-	Mode     os.FileMode
-	Group    string
-	GRELocal netip.Addr // optional allow-list for tunnel outer local address
-	Prov     Provisioner
-	OuterMTU func(netip.Addr) (int, error)
+	Log             *slog.Logger
+	Path            string
+	Mode            os.FileMode
+	Group           string
+	GRELocal        netip.Addr // optional allow-list for tunnel outer local address
+	Prov            Provisioner
+	OuterMTU        func(netip.Addr) (int, error)
+	OuterMTUForPath func(netip.Addr, netip.Addr) (int, error)
 	// AllowNames is an optional allow-list of operator-pinned interface names
 	// (from config `interfaces`) that the broker will provision in addition to
 	// the built-in "grem"+key namespace. Names outside both sets are rejected.
@@ -118,6 +128,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 	if s.OuterMTU == nil {
 		s.OuterMTU = gre.OuterMTU
+	}
+	if s.OuterMTUForPath == nil {
+		s.OuterMTUForPath = gre.OuterMTUForPath
 	}
 	for _, name := range s.AllowNames {
 		if !gre.ValidName(name) {
@@ -233,6 +246,14 @@ func (s *Server) handle(conn net.Conn) {
 			resp.Error = "invalid local address"
 		} else if s.GRELocal.IsValid() && req.Local != s.GRELocal {
 			resp.Error = "local address not allowed"
+		} else if req.Remote.IsValid() {
+			if req.Remote.IsMulticast() || req.Remote.IsUnspecified() || req.Remote.Is6() != req.Local.Is6() {
+				resp.Error = "invalid remote address"
+			} else if mtu, err := s.OuterMTUForPath(req.Local, req.Remote); err != nil {
+				resp.Error = err.Error()
+			} else {
+				resp.MTU = mtu
+			}
 		} else if mtu, err := s.OuterMTU(req.Local); err != nil {
 			resp.Error = err.Error()
 		} else {

@@ -34,6 +34,16 @@ type Params struct {
 	InnerLocal netip.Addr // inner address assigned on this interface
 	InnerPeer  netip.Addr // inner address of the tunnel peer (routed on-link)
 	LinkLocal  netip.Addr // deterministic fe80:: address; zero keeps kernel default
+
+	// FOUSport/FOUDport wrap the GRE packet in a UDP header (Foo-over-UDP)
+	// when FOUDport is non-zero — outer traffic then looks like plain UDP,
+	// which passes through NAT/firewalls/ISPs that block raw GRE (protocol
+	// 47) outright. FOUSport is this end's own local FOU port (also the port
+	// EnsureFOUReceive must be listening on to decapsulate the peer's
+	// traffic); FOUDport is the peer's listening port. Both zero disables
+	// FOU — the tunnel carries plain GRE as before.
+	FOUSport uint16
+	FOUDport uint16
 }
 
 // Overhead returns the per-packet encapsulation overhead in bytes for an outer
@@ -46,6 +56,12 @@ func Overhead(outer netip.Addr, keyed ...bool) int {
 // OverheadWithOptions returns the GRE+outer-IP overhead for explicit GRE key and
 // sequence-number settings.
 func OverheadWithOptions(outer netip.Addr, keyed, seq bool) int {
+	return OverheadWithFOU(outer, keyed, seq, false)
+}
+
+// OverheadWithFOU is OverheadWithOptions plus the extra 8-byte UDP header
+// when the tunnel is wrapped in Foo-over-UDP (see Params.FOUDport).
+func OverheadWithFOU(outer netip.Addr, keyed, seq, fou bool) int {
 	greHeader := 4 // base GRE header
 	if keyed {
 		greHeader += 4 // key field
@@ -53,10 +69,16 @@ func OverheadWithOptions(outer netip.Addr, keyed, seq bool) int {
 	if seq {
 		greHeader += 4 // sequence-number field
 	}
+	overhead := greHeader
 	if outer.Is6() {
-		return 40 + greHeader // IPv6 outer header
+		overhead += 40 // IPv6 outer header
+	} else {
+		overhead += 20 // IPv4 outer header
 	}
-	return 20 + greHeader // IPv4 outer header
+	if fou {
+		overhead += 8 // UDP header
+	}
+	return overhead
 }
 
 func hostBits(a netip.Addr) int {
@@ -185,6 +207,13 @@ func RemoveNamedGRE(names []string) ([]string, error) {
 
 // OuterMTU returns the MTU of the interface that owns the local outer address,
 // letting the server contribute its real link MTU to negotiation.
+
 func OuterMTU(local netip.Addr) (int, error) {
 	return linkMTUByAddr(local)
+}
+
+// OuterMTUForPath returns the kernel route MTU for packets from local to remote,
+// falling back to the egress link MTU when the route has no explicit/cached PMTU.
+func OuterMTUForPath(local, remote netip.Addr) (int, error) {
+	return pathMTU(local, remote)
 }

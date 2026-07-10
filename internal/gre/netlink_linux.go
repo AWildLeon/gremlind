@@ -24,21 +24,38 @@ var errNoDevice = errors.New("gre: no such device")
 
 // IFLA_GRE_* attribute types (from linux/if_tunnel.h) — not exported by x/sys/unix.
 const (
-	iflaGreIFlags = 2
-	iflaGreOFlags = 3
-	iflaGreIKey   = 4
-	iflaGreOKey   = 5
-	iflaGreLocal  = 6
-	iflaGreRemote = 7
+	iflaGreIFlags     = 2
+	iflaGreOFlags     = 3
+	iflaGreIKey       = 4
+	iflaGreOKey       = 5
+	iflaGreLocal      = 6
+	iflaGreRemote     = 7
+	iflaGreEncapType  = 14
+	iflaGreEncapFlags = 15
+	iflaGreEncapSport = 16
+	iflaGreEncapDport = 17
 
 	greSeqFlag = 0x1000 // GRE_SEQ flag in the GRE header flags field
 	greKeyFlag = 0x2000 // GRE_KEY flag in the GRE header flags field
+
+	// TUNNEL_ENCAP_FOU from linux/if_tunnel.h — Foo-over-UDP encapsulation.
+	tunnelEncapFOU = 1
 )
 
 func align4(n int) int { return (n + 3) &^ 3 }
 
 func beU16(v uint16) []byte { return []byte{byte(v >> 8), byte(v)} }
 func beU32(v uint32) []byte { return []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)} }
+
+// nativeU16 encodes v in host byte order — unlike beU16, used for netlink
+// fields the kernel reads with nla_get_u16 (a plain local value, not a
+// wire-format field). IFLA_GRE_ENCAP_TYPE/ENCAP_FLAGS are nla_get_u16;
+// ENCAP_SPORT/ENCAP_DPORT are nla_get_be16 (real port numbers) and use beU16.
+func nativeU16(v uint16) []byte {
+	b := make([]byte, 2)
+	native.PutUint16(b, v)
+	return b
+}
 
 // nlmsg builds a single rtnetlink message: a NlMsghdr followed by a fixed
 // service header and a sequence of (possibly nested) attributes.
@@ -86,7 +103,14 @@ func (m *nlmsg) finalize() []byte {
 // terminating NLMSG_ERROR ack (error code 0 = success). For dump=true it
 // collects every response payload until NLMSG_DONE.
 func nlExec(req []byte, dump bool) ([][]byte, error) {
-	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
+	return nlExecProto(unix.NETLINK_ROUTE, req, dump)
+}
+
+// nlExecProto is nlExec generalized over the netlink protocol/family, so the
+// same minimal request/response plumbing serves both rtnetlink (this file)
+// and genetlink (fou_linux.go).
+func nlExecProto(proto int, req []byte, dump bool) ([][]byte, error) {
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, proto)
 	if err != nil {
 		return nil, fmt.Errorf("gre: netlink socket: %w", err)
 	}
@@ -273,6 +297,14 @@ func linkMTUByAddr(outer netip.Addr) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	mtu, err := linkMTUByIndex(idx)
+	if err != nil {
+		return 0, err
+	}
+	return mtu, nil
+}
+
+func linkMTUByIndex(idx int32) (int, error) {
 	m := newNlmsg(unix.RTM_GETLINK, unix.NLM_F_REQUEST|unix.NLM_F_DUMP)
 	m.put(make([]byte, unix.SizeofIfInfomsg))
 	msgs, err := nlExec(m.finalize(), true)
@@ -292,7 +324,68 @@ func linkMTUByAddr(outer netip.Addr) (int, error) {
 			}
 		}
 	}
-	return 0, fmt.Errorf("gre: MTU not found for %s", outer)
+	return 0, fmt.Errorf("gre: MTU not found for ifindex %d", idx)
+}
+
+// pathMTU asks the kernel how packets from local to remote would be routed and
+// returns that route's MTU. This is more accurate than looking up the interface
+// owning the source address when the address lives on a dummy/loopback device,
+// when policy routing chooses another egress link, or when a cached PMTU/route
+// MTU is lower than the link MTU.
+func pathMTU(local, remote netip.Addr) (int, error) {
+	if !local.IsValid() || !remote.IsValid() || local.Is6() != remote.Is6() {
+		return 0, fmt.Errorf("gre: invalid MTU route lookup local=%s remote=%s", local, remote)
+	}
+
+	const (
+		rtaDst     = 1
+		rtaSrc     = 2
+		rtaOIF     = 4
+		rtaMetrics = 8
+		rtaxMTU    = 2
+	)
+
+	m := newNlmsg(unix.RTM_GETROUTE, unix.NLM_F_REQUEST)
+	rtm := make([]byte, unix.SizeofRtMsg)
+	rtm[0] = addrFamily(remote)
+	rtm[1] = byte(remote.BitLen()) // Dst_len
+	rtm[2] = byte(local.BitLen())  // Src_len
+	m.put(rtm)
+	m.attr(rtaDst, remote.AsSlice())
+	m.attr(rtaSrc, local.AsSlice())
+
+	msgs, err := nlExec(m.finalize(), false)
+	if err != nil {
+		return 0, err
+	}
+	for _, p := range msgs {
+		if len(p) < unix.SizeofRtMsg {
+			continue
+		}
+		var ifindex int32
+		var routeMTU int
+		for _, a := range parseAttrs(p[unix.SizeofRtMsg:]) {
+			switch a.typ {
+			case rtaOIF:
+				if len(a.data) >= 4 {
+					ifindex = int32(native.Uint32(a.data))
+				}
+			case rtaMetrics:
+				for _, ma := range parseAttrs(a.data) {
+					if ma.typ == rtaxMTU && len(ma.data) >= 4 {
+						routeMTU = int(native.Uint32(ma.data))
+					}
+				}
+			}
+		}
+		if routeMTU > 0 {
+			return routeMTU, nil
+		}
+		if ifindex != 0 {
+			return linkMTUByIndex(ifindex)
+		}
+	}
+	return 0, fmt.Errorf("gre: route MTU not found for %s -> %s", local, remote)
 }
 
 // addrOwner dumps addresses and returns the index of the link owning outer.
@@ -355,6 +448,12 @@ func createGRE(p Params) error {
 	}
 	m.attr(iflaGreLocal, p.Local.AsSlice())
 	m.attr(iflaGreRemote, p.Remote.AsSlice())
+	if p.FOUDport != 0 {
+		m.attr(iflaGreEncapType, nativeU16(tunnelEncapFOU))
+		m.attr(iflaGreEncapFlags, nativeU16(0))
+		m.attr(iflaGreEncapSport, beU16(p.FOUSport))
+		m.attr(iflaGreEncapDport, beU16(p.FOUDport))
+	}
 	m.endNested(data)
 	m.endNested(li)
 

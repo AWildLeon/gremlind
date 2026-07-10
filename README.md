@@ -28,8 +28,9 @@ connection cleanly ends the session.
   MTU minus the GRE overhead, not a static config value.
 - Optional GRE keys for demultiplexing (like port numbers), with plain unkeyed
   GRE supported when desired.
-- **Native GRE** whenever there is no NAT in the path. (GRE-in-UDP / FOU as a NAT
-  fallback is future work.)
+- **Native GRE** whenever there is no NAT/filtering in the path, with an
+  optional **GRE-in-UDP (FOU)** fallback (`fou_port`) for links where raw GRE
+  (IP protocol 47) is blocked or mishandled — common on consumer ISP/CPE gear.
 - **Deterministic link-locals**: every tunnel gets fixed `fe80::1` (server) /
   `fe80::2` (client), so routing protocols over the tunnel have a stable next-hop.
 - **Minimal dependencies**: the data-plane talks to the kernel over a small,
@@ -70,6 +71,40 @@ Use `-secret-env NAME` to read from a different variable. Precedence is
 
 See [configs/gremlind.example.yaml](configs/gremlind.example.yaml) for a fully
 commented configuration.
+
+### Dialer source address rules
+
+`client.source_rules` can constrain the local address used by `gremlind connect`.
+Rules are tried in order; each rule may match server prefixes, restrict address
+family, restrict candidate addresses to specific `ifaces`, require candidates to
+be in `include_subnets`, and remove unwanted local/server ranges with
+`exclude_subnets`. The selected address is bound on the TCP control connection and becomes the GRE outer
+address advertised to the server. `client.source_fallback = "kernel"` can opt
+out of strict failure when no rule matches.
+
+### MSS clamping
+
+`mss_clamp` can let gremlind install/remove nftables or iptables TCPMSS rules
+for each tunnel interface. It supports outbound, inbound, or both directions,
+PMTU clamping by default, fixed MSS values via `mss` or per-protocol `mss4` /
+`mss6` overrides, or `mss_mode = "tunnel_mtu"` to derive fixed values from the
+negotiated tunnel MTU (`MTU-40` for IPv4 and `MTU-60` for IPv6). With nftables,
+`monitor = true` starts an event-driven `nft monitor ruleset` watcher that repairs
+gremlind-owned rules after ruleset reloads or table flushes.
+
+### Inside-tunnel healthchecks
+
+`healthcheck` can make the dialer periodically ping the negotiated inner peer
+through the tunnel interface. If the control TCP connection stays alive but GRE
+forwarding breaks, repeated healthcheck failures tear the session down so the
+normal reconnect path can rebuild it when configured to do so. By default,
+threshold failures only log (`actions: ["log"]`); add ordered actions such as
+`["log", "run_script", "reconnect"]` to run a remediation script and/or tear down
+so the reconnect path rebuilds the tunnel. `run_script` uses `healthcheck.script`
+and receives `GREMLIND_HEALTHCHECK_*` environment variables. `packet_size` or
+`packet_sizes` can probe specific ping payload sizes to catch
+size-dependent blackholes; `inter_packet_delay`, `large_packet_delay`, and
+`large_packet_threshold` add spacing around larger probes.
 
 ### Up/down hooks
 
@@ -126,8 +161,7 @@ recovers with the same inner IP), and server-side teardown on disconnect.
 
 Working: dynamic sessions, IPv6-native data-plane, MTU negotiation, PSK auth,
 keepalive/dead-peer detection, seamless roaming (reconnect + sticky inner
-leases), hooks, `status`, NixOS module.
+leases), hooks, `status`, GRE-in-UDP (FOU) fallback, NixOS module.
 
-Future work: GRE-in-UDP/FOU for NAT traversal; TLS-wrapped control channel;
-multiple sessions per control connection (GRE-key multiplexing); lease TTLs and
-server-outer auto-detection.
+Future work: TLS-wrapped control channel; multiple sessions per control
+connection (GRE-key multiplexing); lease TTLs and server-outer auto-detection.

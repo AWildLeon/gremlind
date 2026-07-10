@@ -78,6 +78,16 @@ type Config struct {
 	// NetlinkSocket, when set, makes the server ask a local privileged netlinkd
 	// broker to provision GRE interfaces instead of opening rtnetlink itself.
 	NetlinkSocket string `yaml:"netlink_socket"`
+	// FOUPort wraps the GRE tunnel in Foo-over-UDP on this port when set (0
+	// disables it, plain GRE as before). Outer traffic then looks like
+	// ordinary UDP, which passes through NAT/firewalls/ISPs that block raw
+	// GRE (IP protocol 47) outright. Both peers must set the *same* port —
+	// each listens on it (EnsureFOUReceive) and targets the peer's copy of
+	// it as the encap destination port, so there's no separate negotiation.
+	// Not currently supported together with NetlinkSocket (split-privilege
+	// mode): registering the FOU receive port needs CAP_NET_ADMIN, which
+	// only the netlinkd broker holds in that mode.
+	FOUPort uint16 `yaml:"fou_port"`
 	// MaxPendingHandshakes bounds concurrent unauthenticated handshakes (server
 	// role); 0 uses a built-in default. It caps the resources an unauthenticated
 	// connection flood can pin.
@@ -99,8 +109,10 @@ type Config struct {
 	KeepaliveTimeout  Duration `yaml:"keepalive_timeout"`
 	LeaseTTL          Duration `yaml:"lease_ttl"`
 
-	Auth  Auth  `yaml:"auth"`
-	Hooks Hooks `yaml:"hooks"`
+	Auth        Auth        `yaml:"auth"`
+	Hooks       Hooks       `yaml:"hooks"`
+	MSSClamp    MSSClamp    `yaml:"mss_clamp"`
+	HealthCheck HealthCheck `yaml:"healthcheck"`
 
 	// Interfaces optionally pins a fixed data-plane interface name for specific
 	// clients, keyed by client ID. Clients without an entry keep the default
@@ -115,16 +127,212 @@ type Config struct {
 	Client Client `yaml:"client"`
 }
 
+// HealthCheck verifies data-plane reachability through the tunnel.
+type HealthCheck struct {
+	Enabled              bool     `yaml:"enabled"`
+	Interval             Duration `yaml:"interval"`
+	Timeout              Duration `yaml:"timeout"`
+	Failures             int      `yaml:"failures"`
+	Actions              []string `yaml:"actions"`                // ordered: log | run_script | reconnect
+	Script               string   `yaml:"script"`                 // used by run_script action
+	Target               string   `yaml:"target"`                 // empty = negotiated inner peer
+	PacketSize           int      `yaml:"packet_size"`            // ping payload bytes; 0 = ping default
+	PacketSizes          []int    `yaml:"packet_sizes"`           // optional set of payload sizes to probe
+	InterPacketDelay     Duration `yaml:"inter_packet_delay"`     // delay between packet-size probes
+	LargePacketDelay     Duration `yaml:"large_packet_delay"`     // delay before probes >= threshold; 0 = inter_packet_delay
+	LargePacketThreshold int      `yaml:"large_packet_threshold"` // payload bytes; 0 = any non-default size
+	Command              string   `yaml:"command"`                // ping-compatible binary
+	BindInterface        bool     `yaml:"bind_interface"`         // pass -I <iface>
+}
+
+func (h HealthCheck) WithDefaults() HealthCheck {
+	if h.Interval == 0 {
+		h.Interval = Duration(30 * time.Second)
+	}
+	if h.Timeout == 0 {
+		h.Timeout = Duration(3 * time.Second)
+	}
+	if h.Failures == 0 {
+		h.Failures = 3
+	}
+	if len(h.Actions) == 0 {
+		h.Actions = []string{"log"}
+	}
+	if h.Command == "" {
+		h.Command = "ping"
+	}
+	return h
+}
+
+func (c *Config) validateHealthCheck() error {
+	h := c.HealthCheck
+	if h.Interval.Std() <= 0 {
+		return fmt.Errorf("healthcheck.interval must be positive, got %s", h.Interval.Std())
+	}
+	if h.Timeout.Std() <= 0 {
+		return fmt.Errorf("healthcheck.timeout must be positive, got %s", h.Timeout.Std())
+	}
+	if h.Failures <= 0 {
+		return fmt.Errorf("healthcheck.failures must be positive, got %d", h.Failures)
+	}
+	usesScript := false
+	for i, action := range h.Actions {
+		switch action {
+		case "log", "run_script", "reconnect":
+			if action == "run_script" {
+				usesScript = true
+			}
+		default:
+			return fmt.Errorf("healthcheck.actions[%d] must be \"log\", \"run_script\", or \"reconnect\", got %q", i, action)
+		}
+	}
+	if usesScript && h.Script == "" {
+		return fmt.Errorf("healthcheck.script is required when actions contains run_script")
+	}
+	if h.Target != "" {
+		if _, err := netip.ParseAddr(h.Target); err != nil {
+			return fmt.Errorf("invalid healthcheck.target %q: %w", h.Target, err)
+		}
+	}
+	if h.PacketSize < 0 || h.PacketSize > 65507 {
+		return fmt.Errorf("healthcheck.packet_size must be between 0 and 65507, got %d", h.PacketSize)
+	}
+	for i, size := range h.PacketSizes {
+		if size < 0 || size > 65507 {
+			return fmt.Errorf("healthcheck.packet_sizes[%d] must be between 0 and 65507, got %d", i, size)
+		}
+	}
+	if h.InterPacketDelay.Std() < 0 {
+		return fmt.Errorf("healthcheck.inter_packet_delay must be >= 0, got %s", h.InterPacketDelay.Std())
+	}
+	if h.LargePacketDelay.Std() < 0 {
+		return fmt.Errorf("healthcheck.large_packet_delay must be >= 0, got %s", h.LargePacketDelay.Std())
+	}
+	if h.LargePacketThreshold < 0 || h.LargePacketThreshold > 65507 {
+		return fmt.Errorf("healthcheck.large_packet_threshold must be between 0 and 65507, got %d", h.LargePacketThreshold)
+	}
+	if h.Command == "" {
+		return fmt.Errorf("healthcheck.command must be non-empty")
+	}
+	return nil
+}
+
+// MSSClamp optionally installs/removes firewall rules that clamp TCP MSS for
+// traffic entering/leaving gremlind tunnel interfaces.
+type MSSClamp struct {
+	Enabled        bool   `yaml:"enabled"`
+	Backend        string `yaml:"backend"`   // nftables | iptables
+	Direction      string `yaml:"direction"` // out | in | both
+	MSSMode        string `yaml:"mss_mode"`  // pmtu | tunnel_mtu
+	MSS            int    `yaml:"mss"`       // 0 = mode default, >0 = fixed MSS for both families
+	MSS4           int    `yaml:"mss4"`      // overrides mss/mode for IPv4 when >0
+	MSS6           int    `yaml:"mss6"`      // overrides mss/mode for IPv6 when >0
+	NFTFamily      string `yaml:"nft_family"`
+	NFTTable       string `yaml:"nft_table"`
+	NFTChain       string `yaml:"nft_chain"`
+	NFTManageTable bool   `yaml:"nft_manage_table"`
+	IPTablesChain  string `yaml:"iptables_chain"`
+	Monitor        bool   `yaml:"monitor"` // nftables: watch ruleset changes and repair missing rules
+}
+
+func (m MSSClamp) WithDefaults() MSSClamp {
+	if m.Backend == "" {
+		m.Backend = "nftables"
+	}
+	if m.Direction == "" {
+		m.Direction = "out"
+	}
+	if m.MSSMode == "" {
+		m.MSSMode = "pmtu"
+	}
+	if m.NFTFamily == "" {
+		m.NFTFamily = "inet"
+	}
+	if m.NFTTable == "" {
+		m.NFTTable = "gremlind"
+	}
+	if m.NFTChain == "" {
+		m.NFTChain = "forward"
+	}
+	if m.IPTablesChain == "" {
+		m.IPTablesChain = "FORWARD"
+	}
+	return m
+}
+
+func (c *Config) validateMSSClamp() error {
+	m := c.MSSClamp
+	switch m.Backend {
+	case "nftables", "iptables":
+	default:
+		return fmt.Errorf("mss_clamp.backend must be \"nftables\" or \"iptables\", got %q", m.Backend)
+	}
+	switch m.Direction {
+	case "out", "in", "both":
+	default:
+		return fmt.Errorf("mss_clamp.direction must be \"out\", \"in\", or \"both\", got %q", m.Direction)
+	}
+	switch m.MSSMode {
+	case "pmtu", "tunnel_mtu":
+	default:
+		return fmt.Errorf("mss_clamp.mss_mode must be \"pmtu\" or \"tunnel_mtu\", got %q", m.MSSMode)
+	}
+	for field, value := range map[string]int{"mss": m.MSS, "mss4": m.MSS4, "mss6": m.MSS6} {
+		if value < 0 || value > 65535 {
+			return fmt.Errorf("mss_clamp.%s must be between 0 and 65535, got %d", field, value)
+		}
+	}
+	if m.Backend == "nftables" && (m.NFTFamily == "" || m.NFTTable == "" || m.NFTChain == "") {
+		return fmt.Errorf("mss_clamp nft_family, nft_table and nft_chain must be non-empty")
+	}
+	if m.Backend == "iptables" && m.IPTablesChain == "" {
+		return fmt.Errorf("mss_clamp.iptables_chain must be non-empty")
+	}
+	return nil
+}
+
 // Client configures the dialer role.
 type Client struct {
 	// ID identifies this client to the server (matched against auth.clients).
 	ID string `yaml:"id"`
 	// Secret is the shared secret; falls back to auth.psk when empty.
 	Secret string `yaml:"secret"`
+	// Iface names the local GRE tunnel interface. Defaults to "grem0"; set
+	// this explicitly when a host runs more than one connect instance at
+	// once (each needs its own interface name — see -iface / DefaultIface).
+	Iface string `yaml:"iface"`
+	// SourceRules constrain which local source address may be used for the
+	// control connection, and therefore for the GRE outer endpoint advertised
+	// to the server. The first rule that yields a usable address wins.
+	SourceRules []SourceRule `yaml:"source_rules"`
+	// SourceFallback controls what happens when SourceRules are configured but no
+	// rule matches. "fail" is strict; "kernel" leaves source selection to the OS.
+	SourceFallback string `yaml:"source_fallback"`
+}
+
+// SourceRule selects candidate local source addresses for the dialer.
+type SourceRule struct {
+	// Ifaces, when non-empty, restricts candidates to addresses configured on
+	// these interface names. Empty means all up interfaces.
+	Ifaces []string `yaml:"ifaces"`
+	// Family optionally restricts candidate/source server families: "ipv4",
+	// "ipv6", or "any"/"".
+	Family string `yaml:"family"`
+	// MatchServerSubnets makes the rule apply only when the configured server
+	// resolves to at least one address in these CIDR prefixes.
+	MatchServerSubnets []string `yaml:"match_server_subnets"`
+	// IncludeSubnets, when non-empty, only allows candidates inside these CIDRs.
+	IncludeSubnets []string `yaml:"include_subnets"`
+	// ExcludeSubnets removes local candidates contained in any listed CIDR prefix;
+	// if the server resolves into one of these prefixes, this rule is skipped too.
+	ExcludeSubnets []string `yaml:"exclude_subnets"`
 }
 
 // DefaultListen is used when Listen is empty. It is v6-native/dual-stack.
 const DefaultListen = "[::]:4747"
+
+// DefaultIface is used when Client.Iface is empty.
+const DefaultIface = "grem0"
 
 const MinSecretLen = 32
 
@@ -165,6 +373,17 @@ func (c *Config) ApplyDefaults() {
 	if c.AdminSocketMode == "" {
 		c.AdminSocketMode = "0600"
 	}
+	if c.Client.Iface == "" {
+		c.Client.Iface = DefaultIface
+	}
+	if c.MSSClamp.Enabled && (c.MSSClamp.Backend == "" || c.MSSClamp.Backend == "nftables") && c.MSSClamp.NFTTable == "" && c.MSSClamp.NFTChain == "" {
+		c.MSSClamp.NFTManageTable = true
+	}
+	c.MSSClamp = c.MSSClamp.WithDefaults()
+	c.HealthCheck = c.HealthCheck.WithDefaults()
+	if c.Client.SourceFallback == "" {
+		c.Client.SourceFallback = "fail"
+	}
 }
 
 // GREKeyEnabled reports whether GRE key fields should be used.
@@ -179,6 +398,9 @@ func (c *Config) GRESeqEnabled() bool { return c.GRESeq != nil && *c.GRESeq }
 func (c *Config) validate() error {
 	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 		return fmt.Errorf("invalid listen %q: %w", c.Listen, err)
+	}
+	if c.FOUPort != 0 && c.NetlinkSocket != "" {
+		return fmt.Errorf("fou_port is not supported together with netlink_socket (split-privilege mode)")
 	}
 	if c.MTU < 0 {
 		return fmt.Errorf("mtu must be >= 0, got %d", c.MTU)
@@ -202,6 +424,16 @@ func (c *Config) validate() error {
 	if c.LeaseTTL.Std() < 0 {
 		return fmt.Errorf("lease_ttl must be >= 0, got %s", c.LeaseTTL.Std())
 	}
+	if c.MSSClamp.Enabled {
+		if err := c.validateMSSClamp(); err != nil {
+			return err
+		}
+	}
+	if c.HealthCheck.Enabled {
+		if err := c.validateHealthCheck(); err != nil {
+			return err
+		}
+	}
 	if _, err := c.AdminMode(); err != nil {
 		return err
 	}
@@ -213,6 +445,29 @@ func (c *Config) validate() error {
 	if c.GRELocal != "" {
 		if _, err := netip.ParseAddr(c.GRELocal); err != nil {
 			return fmt.Errorf("invalid gre_local %q: %w", c.GRELocal, err)
+		}
+	}
+	switch c.Client.SourceFallback {
+	case "", "fail", "kernel":
+	default:
+		return fmt.Errorf("client.source_fallback must be \"fail\" or \"kernel\", got %q", c.Client.SourceFallback)
+	}
+	for i, rule := range c.Client.SourceRules {
+		switch rule.Family {
+		case "", "any", "ipv4", "ipv6":
+		default:
+			return fmt.Errorf("client.source_rules[%d].family must be \"ipv4\", \"ipv6\", or \"any\", got %q", i, rule.Family)
+		}
+		for field, prefixes := range map[string][]string{
+			"match_server_subnets": rule.MatchServerSubnets,
+			"include_subnets":      rule.IncludeSubnets,
+			"exclude_subnets":      rule.ExcludeSubnets,
+		} {
+			for _, prefix := range prefixes {
+				if _, err := netip.ParsePrefix(prefix); err != nil {
+					return fmt.Errorf("invalid client.source_rules[%d].%s prefix %q: %w", i, field, prefix, err)
+				}
+			}
 		}
 	}
 	return nil

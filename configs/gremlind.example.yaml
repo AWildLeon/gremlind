@@ -16,9 +16,11 @@ mtu: 0
 
 # Use GRE key fields as a demultiplexing identifier (like a port number). Set to
 # false for plain GRE without keys. Keys are not an authentication mechanism.
+# Ignored/forced off when fou_port is enabled.
 gre_key: true
 # GRE sequence numbers add per-packet sequence fields. Usually leave off unless
 # both your kernel/path need them; the server's setting wins for clients.
+# Ignored/forced off when fou_port is enabled.
 gre_seq: false
 
 # Unix socket for `gremlind status`. Empty string disables it. Default mode is
@@ -30,7 +32,16 @@ admin_socket_group: ""
 # Optional split-privilege mode: run `gremlind netlinkd -s /run/gremlind-netlink.sock`
 # with CAP_NET_ADMIN and point the Internet-facing server at this socket. Then
 # the server does not need direct rtnetlink/kernel provisioning privileges.
+# Not currently supported together with fou_port below.
 netlink_socket: ""
+
+# Wrap the GRE tunnel in Foo-over-UDP on this port when set (0 = disabled,
+# plain GRE). Outer traffic then looks like ordinary UDP, which passes
+# through NAT/firewalls/ISPs that block raw GRE (IP protocol 47) outright —
+# common on consumer DSL/PPPoE CPE gear. Both peers must set the *same* port;
+# there's no separate negotiation. GRE key and sequence fields are forced off in
+# FOU mode to avoid redundant per-packet overhead.
+fou_port: 0
 
 # DoS hardening: bound how many connections may be mid-handshake (accepted but
 # not yet authenticated) at once — globally and per source IP. Beyond the limit
@@ -55,6 +66,48 @@ keepalive_timeout: 45s
 # Set to 0s to keep old leases until daemon restart.
 lease_ttl: 24h
 
+# Optional MSS clamping for routed TCP traffic using gremlind tunnel interfaces.
+# mss_mode = pmtu uses PMTU clamp (`rt mtu`/`rt6 mtu` for nftables,
+# --clamp-mss-to-pmtu for iptables). mss_mode = tunnel_mtu derives fixed MSS
+# from gremlind's negotiated tunnel MTU (IPv4: MTU-40, IPv6: MTU-60). Set mss
+# for a fixed value for both protocols, or mss4/mss6 to set IPv4/IPv6 separately.
+# nft_manage_table creates a small dedicated inet/gremlind/forward chain when
+# using the defaults.
+mss_clamp:
+  enabled: false
+  backend: "nftables" # nftables | iptables
+  direction: "out"    # out | in | both
+  mss_mode: "pmtu" # pmtu | tunnel_mtu
+  mss: 0
+  mss4: 0
+  mss6: 0
+  nft_family: "inet"
+  nft_table: "gremlind"
+  nft_chain: "forward"
+  nft_manage_table: true
+  iptables_chain: "FORWARD"
+  monitor: false # nftables: event-driven repair after ruleset reloads/flushes
+
+# Optional dialer-side data-plane healthcheck. This probes the negotiated inner
+# peer address through the tunnel interface; after N consecutive failures the
+# dialer tears down and reconnects, catching cases where the TCP control channel
+# is alive but GRE forwarding is wedged. `target` can override the peer address.
+healthcheck:
+  enabled: false
+  interval: 30s
+  timeout: 3s
+  failures: 3
+  actions: ["log"] # ordered actions after threshold: log, run_script, reconnect
+  script: "" # required when actions contains run_script
+  target: ""
+  packet_size: 0 # ping payload bytes; 0 = ping default
+  # packet_sizes: [0, 1200, 1372] # optional: probe multiple payload sizes
+  inter_packet_delay: 0s # delay between packet-size probes
+  large_packet_delay: 2s # extra spacing before probes >= threshold; 0s = inter_packet_delay
+  large_packet_threshold: 1200
+  command: "ping"
+  bind_interface: true
+
 auth:
   # Use a high-entropy secret; the HMAC handshake is resistant to passive replay
   # but captured handshakes can still be used for offline guessing of weak PSKs.
@@ -64,6 +117,20 @@ auth:
   # clients:
   #   site-a: "replace-with-random-secret-for-site-a"
   #   site-b: "replace-with-random-secret-for-site-b"
+
+client:
+  # Optional source-address selection rules for `gremlind connect`. The first
+  # rule yielding a usable address wins. This controls the TCP control-channel
+  # source address and therefore the GRE outer address advertised to the server.
+  # If rules are configured but none match, source_fallback decides whether to
+  # fail loudly (default) or let the kernel pick normally ("kernel").
+  source_fallback: "fail"
+  # source_rules:
+  #   - family: "ipv6"                  # ipv4 | ipv6 | any
+  #     match_server_subnets: ["2001:db8:feed::/48"]
+  #     ifaces: ["ppp0", "wan0"]        # empty/missing = all up interfaces
+  #     include_subnets: ["2001:db8:1234::/48"]
+  #     exclude_subnets: ["fe80::/10", "fd00::/8", "10.0.0.0/8"]
 
 # Optional pppd-style hooks run on interface up/down.
 hooks:
