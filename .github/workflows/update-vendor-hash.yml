@@ -1,0 +1,77 @@
+name: Update vendorHash
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "go.mod"
+      - "go.sum"
+      - "package.nix"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-vendor-hash
+  cancel-in-progress: true
+
+jobs:
+  update-vendor-hash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Compute correct vendorHash
+        id: hash
+        run: |
+          set -euo pipefail
+
+          current=$(grep -oP 'vendorHash = "\K[^"]+' package.nix)
+          echo "current=$current"
+
+          # Force a rebuild of the go-modules FOD with a fake hash so Nix
+          # reports the correct one, then parse the "got:" line.
+          sed -i 's|vendorHash = "[^"]*"|vendorHash = lib.fakeHash|' package.nix
+
+          # attr name differs across nixpkgs versions: goModules vs go-modules
+          out=$(nix build --no-link .#default.goModules 2>&1 \
+            || nix build --no-link '.#default.go-modules' 2>&1 || true)
+          got=$(echo "$out" | grep -oP 'got:\s+\K\S+' | head -n1 || true)
+
+          # Restore original file; we rewrite it below only if needed.
+          git checkout -- package.nix
+
+          if [ -z "$got" ]; then
+            echo "Could not determine vendorHash — build may have failed for other reasons." >&2
+            exit 1
+          fi
+
+          echo "got=$got"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "correct=$got" >> "$GITHUB_OUTPUT"
+
+      - name: Apply new vendorHash
+        if: steps.hash.outputs.current != steps.hash.outputs.correct
+        run: |
+          sed -i 's|vendorHash = "[^"]*"|vendorHash = "${{ steps.hash.outputs.correct }}"|' package.nix
+
+      - name: Open PR
+        if: steps.hash.outputs.current != steps.hash.outputs.correct
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "build: update vendorHash"
+          title: "build: update vendorHash"
+          body: |
+            Automated update of `vendorHash` in `package.nix`.
+
+            - old: `${{ steps.hash.outputs.current }}`
+            - new: `${{ steps.hash.outputs.correct }}`
+          branch: auto/update-vendor-hash
+          delete-branch: true
