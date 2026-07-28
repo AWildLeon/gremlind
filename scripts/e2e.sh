@@ -191,6 +191,56 @@ if ip link show type ip6gre | grep -q "grem[0-9a-f]"; then
   exit 1
 fi
 
+echo "== static lease (server-pinned inner address) =="
+kill "$SRV_PID" 2>/dev/null || true
+wait "$SRV_PID" 2>/dev/null || true
+SRV_PID=""
+PINNED_INNER="fd00:9::a0"
+
+cat >"$workdir/server-lease.yaml" <<EOF
+listen: "[::]:$PORT"
+gre_local: "$SRV_OUTER"
+inner_pool: "fd00:9::/112"
+server_inner: "$SRV_INNER"
+mtu: 0
+admin_socket: "$workdir/admin-lease.sock"
+keepalive_interval: 1s
+keepalive_timeout: 3s
+auth:
+  psk: "$PSK"
+leases:
+  site-a: "$PINNED_INNER"
+EOF
+
+"$BIN" server -c "$workdir/server-lease.yaml" -v &
+SRV_PID=$!
+
+for _ in $(seq 1 50); do
+  if cns bash -c "exec 3<>/dev/tcp/$SRV_OUTER/$PORT" 2>/dev/null; then break; fi
+  sleep 0.1
+done
+
+nsenter --net="$CLI_NS" "$BIN" connect "[$SRV_OUTER]:$PORT" -c "$workdir/client.yaml" -v &
+CLI_PID=$!
+
+for _ in $(seq 1 50); do
+  if cns ip -6 addr show grem0 2>/dev/null | grep -q "$PINNED_INNER"; then break; fi
+  sleep 0.1
+done
+if ! cns ip -6 addr show grem0 2>/dev/null | grep -q "$PINNED_INNER"; then
+  echo "E2E RESULT: FAIL (client did not get its pinned inner address $PINNED_INNER)"
+  cns ip -6 addr show grem0 || true
+  exit 1
+fi
+if ! cns ping -6 -c 3 -W 2 "$SRV_INNER"; then
+  echo "E2E RESULT: FAIL (static lease ping)"
+  exit 1
+fi
+echo "static lease OK: site-a pinned to $PINNED_INNER"
+
+kill "$CLI_PID" 2>/dev/null || true
+CLI_PID=""
+
 echo "== FOU (GRE-in-UDP) fallback =="
 kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true

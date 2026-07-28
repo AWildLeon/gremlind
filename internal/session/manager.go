@@ -60,7 +60,8 @@ type Manager struct {
 	upHook      string
 	downHook    string
 	leaseTTL    time.Duration
-	ifNames     map[string]string // client ID -> pinned interface name (optional)
+	ifNames     map[string]string     // client ID -> pinned interface name (optional)
+	staticLease map[string]netip.Addr // client ID -> pinned inner address (optional)
 	fouPort     uint16
 	mssClamp    config.MSSClamp
 
@@ -87,8 +88,13 @@ type Config struct {
 	// Interfaces optionally pins a fixed interface name per client ID; clients
 	// without an entry keep the default per-session "grem"+key naming.
 	Interfaces map[string]string
-	FOUPort    uint16 // wrap tunnels in Foo-over-UDP on this port; 0 = plain GRE
-	MSSClamp   config.MSSClamp
+	// Leases optionally pins a fixed inner address per client ID; clients
+	// without an entry get one from the pool as before. The addresses are
+	// expected to be pinned in Pool (see ippool.Pool.Pin) so they are never
+	// handed to a dynamic client.
+	Leases   map[string]netip.Addr
+	FOUPort  uint16 // wrap tunnels in Foo-over-UDP on this port; 0 = plain GRE
+	MSSClamp config.MSSClamp
 }
 
 // New builds a Manager using the real netlink data-plane.
@@ -130,6 +136,7 @@ func newWith(cfg Config, prov Provisioner) *Manager {
 		downHook:    cfg.DownHook,
 		leaseTTL:    cfg.LeaseTTL,
 		ifNames:     cfg.Interfaces,
+		staticLease: cfg.Leases,
 		fouPort:     cfg.FOUPort,
 		mssClamp:    cfg.MSSClamp,
 		sessions:    make(map[uint32]*Entry),
@@ -164,6 +171,8 @@ func (m *Manager) Establish(ctx context.Context, p control.SessionParams) (contr
 	clientInner, err := m.allocInnerLocked(p.ClientID, p.RequestedInner)
 	if err != nil {
 		m.mu.Unlock()
+		m.log.Error("inner address allocation failed, refusing session",
+			"client", p.ClientID, "outer", p.ClientOuter, "err", err)
 		return control.SessionGrant{}, control.ResultNoAddresses, err
 	}
 	sessionKey, err := m.randomKeyLocked()
@@ -373,14 +382,29 @@ func minimumTunnelMTU(outer netip.Addr) int {
 	return 576 // IPv4 minimum reassembly MTU; prevents negative/overflow MTUs.
 }
 
-// allocInnerLocked assigns an inner address, preferring stability: an explicit
-// client request first, then the client's sticky lease (its previous address),
-// and finally a fresh address. Sticky leases are treated as reservations while
-// they are unexpired: an authenticated client must not be able to request or be
-// freshly allocated another client's inactive lease. Caller must hold m.mu.
-// AllocateSpecific/Allocate mutate only the pool's own state, which is
-// independently locked.
+// allocInnerLocked assigns an inner address, preferring stability: a statically
+// configured lease first, then an explicit client request, then the client's
+// sticky lease (its previous address), and finally a fresh address. Sticky
+// leases are treated as reservations while they are unexpired: an authenticated
+// client must not be able to request or be freshly allocated another client's
+// inactive lease. Caller must hold m.mu. AllocateSpecific/Allocate mutate only
+// the pool's own state, which is independently locked.
 func (m *Manager) allocInnerLocked(clientID string, requested netip.Addr) (netip.Addr, error) {
+	// A static lease is absolute: the operator configured this address for this
+	// client, and nothing else will do. If it cannot be claimed — configured for
+	// another client, or still held by a session that has not been torn down —
+	// fail the connection rather than quietly falling back to a dynamic address,
+	// which would reintroduce exactly the instability static leases remove.
+	if static, ok := m.staticLease[clientID]; ok {
+		if !m.leaseAvailableToLocked(clientID, static) {
+			return netip.Addr{}, fmt.Errorf("static lease %s for client %q is claimed by another client", static, clientID)
+		}
+		if err := m.pool.AllocateSpecific(static); err != nil {
+			return netip.Addr{}, fmt.Errorf("static lease %s for client %q is unavailable: %w", static, clientID, err)
+		}
+		return static, nil
+	}
+
 	for _, cand := range []netip.Addr{requested, m.leases[clientID]} {
 		if cand.IsValid() && m.leaseAvailableToLocked(clientID, cand) {
 			if err := m.pool.AllocateSpecific(cand); err == nil {
@@ -411,9 +435,17 @@ func (m *Manager) allocInnerLocked(clientID string, requested netip.Addr) (netip
 	}
 }
 
-// leaseAvailableToLocked reports whether addr is not reserved by another
-// client's sticky lease. Caller must hold m.mu.
+// leaseAvailableToLocked reports whether addr is free of another client's
+// claim: a statically configured lease, or an unexpired sticky lease. Static
+// leases hold indefinitely — they are config, not session state, so they are
+// never purged and apply before their owner has ever connected. Caller must
+// hold m.mu.
 func (m *Manager) leaseAvailableToLocked(clientID string, addr netip.Addr) bool {
+	for owner, leased := range m.staticLease {
+		if owner != clientID && leased == addr {
+			return false
+		}
+	}
 	for owner, leased := range m.leases {
 		if owner != clientID && leased == addr {
 			return false

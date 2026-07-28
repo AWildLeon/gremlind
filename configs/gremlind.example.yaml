@@ -146,3 +146,15 @@ hooks:
 # interfaces:
 #   site-a: "gremlin-a"
 #   site-b: "gremlin-b"
+
+# Optional fixed inner addresses for specific clients, keyed by client ID —
+# DHCP-style static leases. Clients without an entry get an address from the
+# pool as before. Each address must fall inside inner_pool, must not be
+# server_inner, and must be unique across clients. A pinned address is never
+# handed to another client, so it survives restarts and lease_ttl expiry —
+# use these when something is configured against a fixed per-tunnel address,
+# e.g. a BGP "neighbor" on the border side. A client whose configured address
+# cannot be claimed is refused rather than moved to a dynamic address.
+# leases:
+#   site-a: "fd00:9::a"
+#   site-b: "fd00:9::b"

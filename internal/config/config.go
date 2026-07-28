@@ -123,6 +123,13 @@ type Config struct {
 	// netlinkd via -iface so the broker will provision them.
 	Interfaces map[string]string `yaml:"interfaces"`
 
+	// Leases optionally pins a fixed inner address per client ID. Clients
+	// without an entry get one from the pool as before. Each address must be a
+	// valid address inside InnerPool, must not be ServerInner, and must be
+	// unique across clients. Pinned addresses are withheld from dynamic
+	// allocation, so a client with an entry always gets exactly that address.
+	Leases map[string]string `yaml:"leases"`
+
 	// Client holds dialer-role settings (used by `gremlind connect`).
 	Client Client `yaml:"client"`
 }
@@ -537,5 +544,38 @@ func (c *Config) ValidateServer() error {
 		}
 		seen[name] = id
 	}
+	seenLeases := make(map[netip.Addr]string, len(c.Leases))
+	for id, addr := range c.Leases {
+		if !control.ValidClientID(id) {
+			return fmt.Errorf("leases: invalid client id %q (allowed: A-Z a-z 0-9 . _ -, length 1..64)", id)
+		}
+		leased, err := netip.ParseAddr(addr)
+		if err != nil {
+			return fmt.Errorf("leases: invalid address %q for client %q: %w", addr, id, err)
+		}
+		if leased.Is4() != pool.Addr().Is4() {
+			return fmt.Errorf("leases: address %s for client %q does not match the address family of inner_pool %s", leased, id, pool)
+		}
+		if !pool.Contains(leased) {
+			return fmt.Errorf("leases: address %s for client %q is not within inner_pool %s", leased, id, pool)
+		}
+		if leased == inner {
+			return fmt.Errorf("leases: address %s for client %q is the server's own inner address", leased, id)
+		}
+		if other, dup := seenLeases[leased]; dup {
+			return fmt.Errorf("leases: address %s assigned to both %q and %q", leased, other, id)
+		}
+		seenLeases[leased] = id
+	}
 	return nil
+}
+
+// LeaseAddrs returns the statically configured leases parsed as addresses. It
+// must only be called after ValidateServer, which guarantees every value parses.
+func (c *Config) LeaseAddrs() map[string]netip.Addr {
+	out := make(map[string]netip.Addr, len(c.Leases))
+	for id, addr := range c.Leases {
+		out[id] = netip.MustParseAddr(addr)
+	}
+	return out
 }

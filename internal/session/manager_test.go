@@ -43,6 +43,20 @@ func newTestManager(t *testing.T, outerMTU, cap int, prov Provisioner) (*Manager
 	return m, pool
 }
 
+// newTestManagerWithLeases mirrors the server startup path: static leases are
+// pinned in the pool at construction and threaded into the manager.
+func newTestManagerWithLeases(t *testing.T, leases map[string]netip.Addr, prov Provisioner) (*Manager, *ippool.Pool) {
+	t.Helper()
+	m, pool := newTestManager(t, 1500, 0, prov)
+	for _, addr := range leases {
+		if err := pool.Pin(addr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.staticLease = leases
+	return m, pool
+}
+
 func TestEstablishUsesPinnedInterfaceNamePerClient(t *testing.T) {
 	prov := &fakeProv{}
 	m, _ := newTestManager(t, 1500, 0, prov)
@@ -298,6 +312,173 @@ func TestStickyLeaseCannotBeClaimedByDifferentClient(t *testing.T) {
 	}
 	if grantA2.ClientInner != grantA.ClientInner {
 		t.Fatalf("site-a did not get its reserved lease back: got %s want %s", grantA2.ClientInner, grantA.ClientInner)
+	}
+}
+
+func TestStaticLeaseHonouredOnFirstConnect(t *testing.T) {
+	prov := &fakeProv{}
+	pinned := netip.MustParseAddr("fd00:9::42")
+	m, pool := newTestManagerWithLeases(t, map[string]netip.Addr{"site-a": pinned}, prov)
+
+	grant, res, err := m.Establish(context.Background(), control.SessionParams{
+		ClientID:    "site-a",
+		ClientOuter: netip.MustParseAddr("2001:db8::20"),
+		OuterMTU:    1500,
+		// A conflicting request from the client loses to the server's config.
+		RequestedInner: netip.MustParseAddr("fd00:9::99"),
+	})
+	if err != nil || res != control.ResultOK {
+		t.Fatalf("establish site-a: res=%s err=%v", res, err)
+	}
+	if grant.ClientInner != pinned {
+		t.Errorf("client inner = %s, want static lease %s", grant.ClientInner, pinned)
+	}
+	if prov.ensured[0].InnerPeer != pinned {
+		t.Errorf("provisioned inner peer = %s, want %s", prov.ensured[0].InnerPeer, pinned)
+	}
+	// Claimed through the pool, so in-use bookkeeping stays correct.
+	if pool.InUse() != 1 {
+		t.Errorf("pool in use = %d, want 1", pool.InUse())
+	}
+}
+
+func TestStaticLeaseNotHandedToDynamicClient(t *testing.T) {
+	prov := &fakeProv{}
+	// fd00:9::2 is the first address dynamic allocation would otherwise pick.
+	pinned := netip.MustParseAddr("fd00:9::2")
+	m, _ := newTestManagerWithLeases(t, map[string]netip.Addr{"site-a": pinned}, prov)
+	ctx := context.Background()
+
+	grantB, res, err := m.Establish(ctx, control.SessionParams{
+		ClientID: "site-b", ClientOuter: netip.MustParseAddr("2001:db8::30"), OuterMTU: 1500,
+	})
+	if err != nil || res != control.ResultOK {
+		t.Fatalf("establish site-b: res=%s err=%v", res, err)
+	}
+	if grantB.ClientInner == pinned {
+		t.Fatalf("dynamic client got site-a's static lease %s", pinned)
+	}
+
+	// Nor can a dynamic client ask for it explicitly.
+	grantC, res, err := m.Establish(ctx, control.SessionParams{
+		ClientID: "site-c", ClientOuter: netip.MustParseAddr("2001:db8::31"), OuterMTU: 1500,
+		RequestedInner: pinned,
+	})
+	if err != nil || res != control.ResultOK {
+		t.Fatalf("establish site-c: res=%s err=%v", res, err)
+	}
+	if grantC.ClientInner == pinned {
+		t.Fatalf("site-c claimed site-a's static lease %s by request", pinned)
+	}
+
+	// site-a still gets it on its own first connect.
+	grantA, res, err := m.Establish(ctx, control.SessionParams{
+		ClientID: "site-a", ClientOuter: netip.MustParseAddr("2001:db8::20"), OuterMTU: 1500,
+	})
+	if err != nil || res != control.ResultOK {
+		t.Fatalf("establish site-a: res=%s err=%v", res, err)
+	}
+	if grantA.ClientInner != pinned {
+		t.Errorf("site-a inner = %s, want static lease %s", grantA.ClientInner, pinned)
+	}
+}
+
+func TestConflictingStaticLeaseFailsInsteadOfFallingBack(t *testing.T) {
+	addr := netip.MustParseAddr("fd00:9::42")
+
+	// Two clients configured for the same address. Config validation rejects
+	// this, but if it is reached anyway neither client may be quietly moved to a
+	// dynamic address — the connection fails instead.
+	t.Run("configured for two clients", func(t *testing.T) {
+		prov := &fakeProv{}
+		m, pool := newTestManagerWithLeases(t, map[string]netip.Addr{"site-a": addr, "site-b": addr}, prov)
+		for _, id := range []string{"site-a", "site-b"} {
+			_, res, err := m.Establish(context.Background(), control.SessionParams{
+				ClientID: id, ClientOuter: netip.MustParseAddr("2001:db8::20"), OuterMTU: 1500,
+			})
+			if err == nil {
+				t.Fatalf("establish %s: expected the conflicting static lease to fail the session", id)
+			}
+			if res != control.ResultNoAddresses {
+				t.Errorf("establish %s: result = %s, want %s", id, res, control.ResultNoAddresses)
+			}
+		}
+		if got := len(m.Sessions()); got != 0 {
+			t.Errorf("active sessions = %d, want 0 (no dynamic fallback session)", got)
+		}
+		if pool.InUse() != 0 {
+			t.Errorf("pool in use = %d, want 0 (no dynamic fallback address)", pool.InUse())
+		}
+	})
+
+	// The address is already taken in the pool (a stale allocation).
+	t.Run("already allocated", func(t *testing.T) {
+		prov := &fakeProv{}
+		m, pool := newTestManagerWithLeases(t, map[string]netip.Addr{"site-a": addr}, prov)
+		if err := pool.AllocateSpecific(addr); err != nil {
+			t.Fatal(err)
+		}
+
+		_, res, err := m.Establish(context.Background(), control.SessionParams{
+			ClientID: "site-a", ClientOuter: netip.MustParseAddr("2001:db8::20"), OuterMTU: 1500,
+		})
+		if err == nil {
+			t.Fatal("expected an unavailable static lease to fail the session")
+		}
+		if res != control.ResultNoAddresses {
+			t.Errorf("result = %s, want %s", res, control.ResultNoAddresses)
+		}
+		if got := len(m.Sessions()); got != 0 {
+			t.Errorf("active sessions = %d, want 0 (no dynamic fallback session)", got)
+		}
+		if pool.InUse() != 1 {
+			t.Errorf("pool in use = %d, want 1 (no dynamic fallback address)", pool.InUse())
+		}
+	})
+}
+
+func TestStaticLeaseSurvivesEvictionAndLeaseExpiry(t *testing.T) {
+	prov := &fakeProv{}
+	pinned := netip.MustParseAddr("fd00:9::42")
+	m, pool := newTestManagerWithLeases(t, map[string]netip.Addr{"site-a": pinned}, prov)
+	ctx := context.Background()
+
+	p1 := control.SessionParams{ClientID: "site-a", ClientOuter: netip.MustParseAddr("2001:db8::20"), OuterMTU: 1500}
+	grant1, _, err := m.Establish(ctx, p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Roaming reconnect from a new outer IP without a teardown: the old session
+	// is evicted and the same pinned address is re-claimed.
+	p2 := control.SessionParams{ClientID: "site-a", ClientOuter: netip.MustParseAddr("2001:db8::99"), OuterMTU: 1500}
+	grant2, res, err := m.Establish(ctx, p2)
+	if err != nil || res != control.ResultOK {
+		t.Fatalf("roaming re-establish: res=%s err=%v", res, err)
+	}
+	if grant2.ClientInner != pinned || grant1.ClientInner != pinned {
+		t.Fatalf("roaming changed inner IP: %s -> %s, want %s throughout", grant1.ClientInner, grant2.ClientInner, pinned)
+	}
+	if pool.InUse() != 1 {
+		t.Errorf("pool in use = %d, want 1 after eviction", pool.InUse())
+	}
+
+	// Full teardown, then a sticky lease lapse: neither may move the address.
+	m.Teardown(p2, grant2)
+	if pool.InUse() != 0 {
+		t.Fatalf("pool not empty after teardown: %d", pool.InUse())
+	}
+	m.leaseTTL = time.Second
+	m.mu.Lock()
+	m.leaseTimes["site-a"] = time.Now().Add(-2 * time.Second)
+	m.mu.Unlock()
+
+	grant3, res, err := m.Establish(ctx, p1)
+	if err != nil || res != control.ResultOK {
+		t.Fatalf("re-establish after lease expiry: res=%s err=%v", res, err)
+	}
+	if grant3.ClientInner != pinned {
+		t.Errorf("inner after lease expiry = %s, want static lease %s", grant3.ClientInner, pinned)
 	}
 }
 

@@ -161,6 +161,24 @@ let
           gremlind-netlinkd broker via -iface so it will provision them.
         '';
       };
+      leases = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        example = { site-a = "fd00:9::a"; site-b = "fd00:9::b"; };
+        description = ''
+          Fixed inner tunnel addresses for specific clients, keyed by client
+          ID (server role only) — DHCP-style static leases. Clients without
+          an entry get an address from the pool as before. Each address must
+          fall inside innerPool, must not be serverInner, and must be unique
+          across clients; a pinned address is never handed to another client,
+          so it stays stable across restarts and lease_ttl expiry. Use these
+          when something needs to be configured against a fixed per-tunnel
+          address, e.g. a BGP "neighbor" on the border side.
+
+          A client whose configured address cannot be claimed is refused
+          rather than moved to a dynamic address.
+        '';
+      };
     };
   };
 in
@@ -298,6 +316,12 @@ in
               ${lib.concatMapStringsSep "\n" (id: ''
                 printf '  ${id}: "%s"\n' ${lib.escapeShellArg cfg.interfaces.${id}} >> "$out"
               '') (lib.attrNames cfg.interfaces)}
+            ''}
+            ${lib.optionalString (cfg.leases != { }) ''
+              echo 'leases:' >> "$out"
+              ${lib.concatMapStringsSep "\n" (id: ''
+                printf '  ${id}: "%s"\n' ${lib.escapeShellArg cfg.leases.${id}} >> "$out"
+              '') (lib.attrNames cfg.leases)}
             ''}
           '';
         in

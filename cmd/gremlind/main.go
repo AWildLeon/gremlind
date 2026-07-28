@@ -118,6 +118,15 @@ func runServer(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Statically leased addresses are pinned up front so a dynamic client can
+	// never be handed one, even before its owner has connected for the first
+	// time. Their owners still claim them through the pool on connect.
+	staticLeases := cfg.LeaseAddrs() // validated by ValidateServer
+	for id, addr := range staticLeases {
+		if err := pool.Pin(addr); err != nil {
+			return fmt.Errorf("leases: client %q: %w", id, err)
+		}
+	}
 	// FOU already demultiplexes by UDP port + outer addresses, so GRE key and
 	// sequence fields are redundant extra bytes. Force both off regardless of
 	// gre_key/gre_seq whenever GRE is wrapped in UDP.
@@ -139,6 +148,7 @@ func runServer(args []string) error {
 		DownHook:    cfg.Hooks.Down,
 		LeaseTTL:    cfg.LeaseTTL.Std(),
 		Interfaces:  cfg.Interfaces,
+		Leases:      staticLeases,
 		FOUPort:     cfg.FOUPort,
 		MSSClamp:    cfg.MSSClamp,
 	}

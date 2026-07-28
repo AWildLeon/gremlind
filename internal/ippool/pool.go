@@ -17,6 +17,7 @@ type Pool struct {
 	mu       sync.Mutex
 	prefix   netip.Prefix
 	reserved map[netip.Addr]bool
+	pinned   map[netip.Addr]bool
 	used     map[netip.Addr]bool
 }
 
@@ -30,6 +31,7 @@ func New(prefix netip.Prefix, reserved ...netip.Addr) (*Pool, error) {
 	p := &Pool{
 		prefix:   prefix,
 		reserved: make(map[netip.Addr]bool),
+		pinned:   make(map[netip.Addr]bool),
 		used:     make(map[netip.Addr]bool),
 	}
 	for _, r := range reserved {
@@ -40,13 +42,32 @@ func New(prefix netip.Prefix, reserved ...netip.Addr) (*Pool, error) {
 	return p, nil
 }
 
+// Pin marks an address as belonging to one specific consumer: Allocate never
+// hands it out, but AllocateSpecific can still claim it. Statically configured
+// leases are pinned at construction so a dynamic client can never be given an
+// address that is spoken for, even before its owner first connects. Unlike a
+// reserved address, a pinned one is claimable — by the owner, via
+// AllocateSpecific, which keeps the pool's in-use bookkeeping correct.
+func (p *Pool) Pin(a netip.Addr) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.prefix.Contains(a) {
+		return fmt.Errorf("ippool: %s is outside pool %s", a, p.prefix)
+	}
+	if p.reserved[a] {
+		return fmt.Errorf("ippool: %s is reserved", a)
+	}
+	p.pinned[a] = true
+	return nil
+}
+
 // Allocate returns the next free address.
 func (p *Pool) Allocate() (netip.Addr, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// Start at the first usable host (skip the network address itself).
 	for a := p.prefix.Addr().Next(); p.prefix.Contains(a); a = a.Next() {
-		if p.reserved[a] || p.used[a] {
+		if p.reserved[a] || p.pinned[a] || p.used[a] {
 			continue
 		}
 		p.used[a] = true

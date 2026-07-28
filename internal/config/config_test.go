@@ -272,3 +272,38 @@ func TestValidateServerInterfaces(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateServerLeases(t *testing.T) {
+	tests := []struct {
+		name    string
+		leases  map[string]string
+		wantErr bool
+	}{
+		{"valid", map[string]string{"site-a": "fd00:9::42", "site-b": "fd00:9::43"}, false},
+		{"empty ok", nil, false},
+		{"bad client id", map[string]string{"bad id": "fd00:9::42"}, true},
+		{"not an address", map[string]string{"site-a": "fd00:9::/112"}, true},
+		{"outside pool", map[string]string{"site-a": "fd00:8::42"}, true},
+		{"server inner", map[string]string{"site-a": "fd00:9::1"}, true},
+		{"duplicate address", map[string]string{"site-a": "fd00:9::42", "site-b": "fd00:9::42"}, true},
+		{"family mismatch", map[string]string{"site-a": "10.0.0.5"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := validServerConfig()
+			c.Leases = tt.leases
+			err := c.ValidateServer()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateServer() err = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			for id, want := range tt.leases {
+				if got := c.LeaseAddrs()[id]; got.String() != want {
+					t.Errorf("LeaseAddrs()[%q] = %s, want %s", id, got, want)
+				}
+			}
+		})
+	}
+}
