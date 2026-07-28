@@ -30,6 +30,8 @@ const (
 	iflaGreOKey       = 5
 	iflaGreLocal      = 6
 	iflaGreRemote     = 7
+	iflaGreTTL        = 8
+	iflaGreFlags      = 13
 	iflaGreEncapType  = 14
 	iflaGreEncapFlags = 15
 	iflaGreEncapSport = 16
@@ -40,6 +42,30 @@ const (
 
 	// TUNNEL_ENCAP_FOU from linux/if_tunnel.h — Foo-over-UDP encapsulation.
 	tunnelEncapFOU = 1
+
+	// TUNNEL_ENCAP_FLAG_* from linux/if_tunnel.h — request the outer UDP
+	// checksum on the FOU encapsulation. CSUM6 covers an IPv6 outer (a zero
+	// UDP checksum over IPv6 is non-compliant and dropped by some middleboxes);
+	// CSUM covers an IPv4 outer. Neither adds bytes — the UDP header is already
+	// part of the FOU overhead.
+	tunnelEncapFlagCsum  = 0x1
+	tunnelEncapFlagCsum6 = 0x2
+
+	// IP6_TNL_F_IGN_ENCAP_LIMIT from linux/ip6_tunnel.h — do not insert the
+	// 8-byte IPv6 Tunnel Encapsulation Limit destination-option header (RFC
+	// 2473) into the outer packet. Set via IFLA_GRE_FLAGS on ip6gre. The
+	// overhead calc (Overhead*) does not model this header, so leaving it in
+	// makes the negotiated interface MTU 8 bytes too large and silently
+	// blackholes full-size packets; a non-nested p2p tunnel does not need it.
+	ip6TnlFIgnEncapLimit = 0x1
+
+	// Fixed outer hop limit for the encapsulating packet, decoupling it from
+	// the inner TTL/hop limit (the kernel default, "inherit"). A `direct` BGP
+	// session over the tunnel emits an inner hop limit of 1; inheriting that
+	// onto the outer header drops the encapsulated packet at the first underlay
+	// hop. A fixed value lets the outer traverse the internet while the inner
+	// keeps its single-hop semantics.
+	defaultTunnelHopLimit = 64
 )
 
 func align4(n int) int { return (n + 3) &^ 3 }
@@ -54,6 +80,14 @@ func beU32(v uint32) []byte { return []byte{byte(v >> 24), byte(v >> 16), byte(v
 func nativeU16(v uint16) []byte {
 	b := make([]byte, 2)
 	native.PutUint16(b, v)
+	return b
+}
+
+// nativeU32 encodes v in host byte order, for u32 netlink fields the kernel
+// reads with nla_get_u32 — e.g. IFLA_GRE_FLAGS carrying IP6_TNL_F_* flags.
+func nativeU32(v uint32) []byte {
+	b := make([]byte, 4)
+	native.PutUint32(b, v)
 	return b
 }
 
@@ -448,9 +482,29 @@ func createGRE(p Params) error {
 	}
 	m.attr(iflaGreLocal, p.Local.AsSlice())
 	m.attr(iflaGreRemote, p.Remote.AsSlice())
+
+	// Pin the outer hop limit (see defaultTunnelHopLimit) so a `direct` BGP
+	// session's inner hop limit of 1 is never inherited onto the encapsulating
+	// header and dropped on the underlay path.
+	hopLimit := p.HopLimit
+	if hopLimit == 0 {
+		hopLimit = defaultTunnelHopLimit
+	}
+	m.attr(iflaGreTTL, []byte{hopLimit})
+
+	// ip6gre-only: suppress the 8-byte IPv6 Tunnel Encapsulation Limit
+	// destination-option header (see ip6TnlFIgnEncapLimit).
+	if p.Local.Is6() {
+		m.attr(iflaGreFlags, nativeU32(ip6TnlFIgnEncapLimit))
+	}
+
 	if p.FOUDport != 0 {
+		encapFlags := uint16(tunnelEncapFlagCsum)
+		if p.Local.Is6() {
+			encapFlags = tunnelEncapFlagCsum6
+		}
 		m.attr(iflaGreEncapType, nativeU16(tunnelEncapFOU))
-		m.attr(iflaGreEncapFlags, nativeU16(0))
+		m.attr(iflaGreEncapFlags, nativeU16(encapFlags))
 		m.attr(iflaGreEncapSport, beU16(p.FOUSport))
 		m.attr(iflaGreEncapDport, beU16(p.FOUDport))
 	}

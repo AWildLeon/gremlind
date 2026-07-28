@@ -31,6 +31,7 @@ type Params struct {
 	Key        uint32     // GRE key (I/O); zero disables GRE key fields
 	Seq        bool       // enable GRE sequence number fields (both directions)
 	MTU        int        // interface MTU (negotiated)
+	HopLimit   uint8      // outer TTL / IPv6 hop limit; zero = defaultTunnelHopLimit (not "inherit")
 	InnerLocal netip.Addr // inner address assigned on this interface
 	InnerPeer  netip.Addr // inner address of the tunnel peer (routed on-link)
 	LinkLocal  netip.Addr // deterministic fe80:: address; zero keeps kernel default
